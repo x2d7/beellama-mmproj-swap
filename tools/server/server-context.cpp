@@ -18,6 +18,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "server-gpu-swap.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -935,6 +936,13 @@ public:
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
+    // mmproj GPU swap state (keep mmproj on CPU, load to GPU only for image encoding)
+    bool mmproj_gpu_swap = false;
+    bool mmproj_is_on_gpu = false;
+
+    // partial model-layer offload to free VRAM for mmproj during image encoding
+    gpu_swap_manager swap_mgr;
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -1024,6 +1032,8 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+
+        swap_mgr.reset();
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1070,6 +1080,30 @@ private:
             });
         }
         return true;
+    }
+
+    mtmd_context_params make_mmproj_params(bool use_gpu) const {
+        mtmd_context_params mparams = mtmd_context_params_default();
+        mparams.use_gpu          = use_gpu;
+        mparams.print_timings    = false;
+        mparams.n_threads        = params_base.cpuparams.n_threads;
+        mparams.flash_attn_type  = params_base.flash_attn_type;
+        mparams.warmup           = use_gpu ? params_base.warmup : false; // only warmup when on GPU
+        mparams.image_min_tokens = params_base.image_min_tokens;
+        mparams.image_max_tokens = params_base.image_max_tokens;
+        mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
+        mparams.media_marker     = get_media_marker();
+        return mparams;
+    }
+
+    void reload_mmproj(bool use_gpu) {
+        mtmd_free(mctx);
+        mctx = nullptr;
+        auto mparams = make_mmproj_params(use_gpu);
+        mctx = mtmd_init_from_file(params_base.mmproj.path.c_str(), model_tgt, mparams);
+        for (server_slot & slot : slots) {
+            slot.mctx = mctx;
+        }
     }
 
     // load the model and initialize llama_context
@@ -1120,11 +1154,13 @@ private:
         std::string & mmproj_path = params_base.mmproj.path;
         mtmd_context_params mparams = mtmd_context_params_default();
         if (has_mmproj) {
-            mparams.use_gpu          = params_base.mmproj_use_gpu;
+            // when GPU swap is enabled, keep mmproj on CPU initially; it is loaded to GPU only for encoding
+            const bool use_gpu = params_base.mmproj_gpu_swap ? false : params_base.mmproj_use_gpu;
+            mparams.use_gpu          = use_gpu;
             mparams.print_timings    = false;
             mparams.n_threads        = params_base.cpuparams.n_threads;
             mparams.flash_attn_type  = params_base.flash_attn_type;
-            mparams.warmup           = params_base.warmup;
+            mparams.warmup           = use_gpu ? params_base.warmup : false; // only warmup when on GPU
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
@@ -1135,7 +1171,7 @@ private:
         }
 
         // optionally get the memory usage of mmproj
-        if (has_mmproj && params_base.fit_params) {
+        if (has_mmproj && params_base.fit_params && !params_base.mmproj_gpu_swap) {
             int64_t t_start = ggml_time_us();
             auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
             int64_t t_elapsed = ggml_time_us() - t_start;
@@ -1294,6 +1330,15 @@ private:
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+
+            mmproj_gpu_swap = params_base.mmproj_gpu_swap && !model_dft;
+            if (mmproj_gpu_swap) {
+                SRV_INF("%s", "[mtmd] GPU swap enabled: KV cache buffers freed during image encoding, mmproj loaded to GPU only on demand\n");
+                swap_mgr.enabled = true;
+                // Free enough VRAM to fit the mmproj weights (~1.1 GiB) plus the
+                // inference compute buffer (~0.25 GiB) and a safety margin.
+                swap_mgr.target_free_bytes = (size_t)2800 * 1024 * 1024;
+            }
 
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
@@ -3742,6 +3787,28 @@ private:
 
                     bool has_mtmd = false;
 
+                    // swap mmproj to GPU for image encoding (kept on CPU otherwise).
+                    // Only swap when this pass is about to actually encode a media chunk
+                    // (the token at the current position is an unencoded media placeholder),
+                    // so a single image triggers exactly one swap cycle instead of one per
+                    // process_single() re-entry.
+                    const bool will_encode_media =
+                        slot.prompt.n_tokens() < slot.task->n_tokens() &&
+                        input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL;
+                    if (mmproj_gpu_swap && !mmproj_is_on_gpu && will_encode_media) {
+                        SRV_INF("%s", "[mtmd] freeing KV cache buffers to free VRAM for mmproj\n");
+                        swap_mgr.swap_to_mmproj_gpu(mctx, model_tgt, ctx_tgt);
+                        SRV_INF("%s", "[mtmd] swapping mmproj to GPU for image encoding\n");
+                        reload_mmproj(true);
+                        if (!mctx) {
+                            SRV_ERR("%s", "[mtmd] failed to load mmproj to GPU, falling back to CPU\n");
+                            reload_mmproj(false);
+                            swap_mgr.swap_to_model_gpu(mctx, model_tgt, ctx_tgt);
+                        } else {
+                            mmproj_is_on_gpu = true;
+                        }
+                    }
+
                     // check if we should process the image
                     while (true) {
                         auto cur_token_idx = slot.prompt.n_tokens();
@@ -3771,6 +3838,22 @@ private:
                         }
 
                         has_mtmd = true;
+                    }
+
+                    // swap mmproj back to CPU after image encoding. Keep mmproj on the GPU
+                    // (and the KV cache offloaded) across all media chunks of this task, so a
+                    // multi-image request performs a single swap cycle instead of one per batch.
+                    if (mmproj_is_on_gpu &&
+                        input_tokens.find_next_media_chunk(slot.prompt.n_tokens()).first == nullptr) {
+                        SRV_INF("%s", "[mtmd] swapping mmproj back to CPU\n");
+                        reload_mmproj(false);
+                        if (!mctx) {
+                            SRV_ERR("%s", "[mtmd] failed to move mmproj back to CPU\n");
+                        } else {
+                            mmproj_is_on_gpu = false;
+                        }
+                        SRV_INF("%s", "[mtmd] restoring KV cache buffers to GPU\n");
+                        swap_mgr.swap_to_model_gpu(mctx, model_tgt, ctx_tgt);
                     }
 
                     const auto & spans = slot.task->params.message_spans;

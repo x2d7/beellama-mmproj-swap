@@ -267,6 +267,10 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read(llama_io_read_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    // mmproj GPU-swap: offload/restore the KVarN cache buffers to/from host RAM
+    bool offload_to_cpu() override;
+    bool restore_to_gpu() override;
+
     llama_kv_cache * get_metadata_cache() const;
     int32_t mapped_layer_id(int32_t il) const;
     llama_kv_tail_route get_tail_route(int32_t il) const;
@@ -377,4 +381,13 @@ private:
     std::unordered_map<int32_t, int32_t> map_layer_ids;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
     llama_kv_cache::stream_copy_info pending_stream_copies;
+
+    // mmproj GPU-swap: host-side staging for offloaded buffers (parallel to ctxs_bufs)
+    struct kvarn_offload_staging {
+        ggml_backend_buffer_type_t                                  gpu_buft = nullptr; // original (GPU) buffer type
+        std::vector<uint8_t>                                        data;              // full buffer contents
+        std::vector<std::pair<struct ggml_tensor *, size_t>>        tensors;           // (tensor, offset within data) snapshot
+    };
+    std::vector<kvarn_offload_staging> kvarn_offload_staging_;
+    bool kvarn_offloaded_ = false;
 };

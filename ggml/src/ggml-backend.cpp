@@ -1932,6 +1932,17 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     sched->is_alloc = false;
 }
 
+// Free the scheduler's compute buffers (VRAM) without destroying the scheduler.
+// The next ggml_backend_sched_reserve() will re-allocate them. Useful when the
+// compute buffer is not needed for a while (e.g. during vision encoding) and the
+// VRAM is required by another component.
+void ggml_backend_sched_free_buffers(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    ggml_gallocr_free_buffers(sched->galloc);
+    sched->is_reset = false;
+    sched->is_alloc = false;
+}
+
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);

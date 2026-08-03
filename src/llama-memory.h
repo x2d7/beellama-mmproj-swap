@@ -208,6 +208,11 @@ struct llama_memory_i {
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
 
+    // mmproj GPU-swap: offload the KV cache buffers to host RAM (freeing VRAM)
+    // and restore them to the GPU. Default impl (non-KV memories) returns false.
+    virtual bool offload_to_cpu() { return false; }
+    virtual bool restore_to_gpu() { return false; }
+
     // KV-cache-compatible hooks used by composite memories such as hybrid and iSWA.
     // Non-KV memory types keep the defaults and should not be used as attention memory.
     virtual uint32_t get_kv_n_stream() const { return 0; }

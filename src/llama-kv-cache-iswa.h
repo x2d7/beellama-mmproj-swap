@@ -132,6 +132,10 @@ public:
     llama_memory_i * get_base() const;
     llama_memory_i * get_swa () const;
 
+    // mmproj GPU-swap: offload/restore the composed KV caches to/from host RAM
+    bool offload_to_cpu() override;
+    bool restore_to_gpu() override;
+
 private:
     const bool unified;
 

@@ -643,6 +643,25 @@ extern "C" {
 
     LLAMA_API void llama_model_free(struct llama_model * model);
 
+    // GPU swap support: access model tensors by name / index (used to offload weights to CPU)
+    LLAMA_API size_t llama_model_n_tensors(struct llama_model * model);
+    LLAMA_API const char * llama_model_get_tensor_name(struct llama_model * model, size_t i);
+    LLAMA_API struct ggml_tensor * llama_model_get_tensor(struct llama_model * model, const char * name);
+
+    // Re-evaluate backend assignment for all tensors after their buffers changed (GPU swap)
+    LLAMA_API void llama_context_sched_update(struct llama_context * ctx);
+
+    // Return the backend scheduler of a context (used by GPU swap manager)
+    LLAMA_API ggml_backend_sched_t llama_context_get_sched(struct llama_context * ctx);
+
+    // Return the CPU backend of a context (used by GPU swap manager to mark offloaded tensors)
+    LLAMA_API ggml_backend_t llama_context_get_cpu_backend(struct llama_context * ctx);
+
+    // mmproj GPU-swap: offload/restore the KV cache buffers to/from host RAM so
+    // the vision encoder fits on the device during image encoding.
+    LLAMA_API bool llama_kv_cache_offload_to_cpu(struct llama_context * ctx);
+    LLAMA_API bool llama_kv_cache_restore_to_gpu(struct llama_context * ctx);
+
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
             struct llama_context_params   params);

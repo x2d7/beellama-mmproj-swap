@@ -301,6 +301,20 @@ llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
 }
 
+bool llama_memory_hybrid::offload_to_cpu() {
+    if (!mem_attn) {
+        return false;
+    }
+    return mem_attn->offload_to_cpu();
+}
+
+bool llama_memory_hybrid::restore_to_gpu() {
+    if (!mem_attn) {
+        return false;
+    }
+    return mem_attn->restore_to_gpu();
+}
+
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :

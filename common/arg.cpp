@@ -2804,6 +2804,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
+        {"--mmproj-gpu-swap"},
+        "temporarily load mmproj to GPU only for image encoding, then move it back to CPU\n"
+        "(useful when mmproj does not fit in VRAM alongside the model)",
+        [](common_params & params) {
+            params.mmproj_gpu_swap = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--image", "--audio", "--video"}, "FILE",
         "path to an image, audio, or video file. use with multimodal models, use comma-separated values for multiple files\n",
         [](common_params & params, const std::string & value) {

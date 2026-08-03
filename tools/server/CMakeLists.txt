@@ -15,6 +15,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-gpu-swap.cpp
+    server-gpu-swap.h
     server-loop-guard.cpp
     server-loop-guard.h
     server-stream.cpp

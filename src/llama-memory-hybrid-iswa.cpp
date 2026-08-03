@@ -296,6 +296,20 @@ llama_memory_recurrent * llama_memory_hybrid_iswa::get_mem_recr() const {
     return mem_recr.get();
 }
 
+bool llama_memory_hybrid_iswa::offload_to_cpu() {
+    if (!mem_attn) {
+        return false;
+    }
+    return mem_attn->offload_to_cpu();
+}
+
+bool llama_memory_hybrid_iswa::restore_to_gpu() {
+    if (!mem_attn) {
+        return false;
+    }
+    return mem_attn->restore_to_gpu();
+}
+
 //
 // llama_memory_hybrid_iswa_context
 //

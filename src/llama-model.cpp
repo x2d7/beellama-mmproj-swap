@@ -2490,6 +2490,27 @@ void llama_model_free(llama_model * model) {
     delete model;
 }
 
+// GPU swap support: access model tensors by name / index
+size_t llama_model_n_tensors(struct llama_model * model) {
+    if (!model) return 0;
+    return model->tensors_by_name.size();
+}
+
+const char * llama_model_get_tensor_name(struct llama_model * model, size_t i) {
+    if (!model || i >= model->tensors_by_name.size()) return nullptr;
+    return model->tensors_by_name[i].first.c_str();
+}
+
+struct ggml_tensor * llama_model_get_tensor(struct llama_model * model, const char * name) {
+    if (!model || !name) return nullptr;
+    auto it = std::find_if(model->tensors_by_name.begin(), model->tensors_by_name.end(),
+            [name](const std::pair<std::string, ggml_tensor *> & it) {
+                return it.first == name;
+            });
+    if (it == model->tensors_by_name.end()) return nullptr;
+    return it->second;
+}
+
 int32_t llama_model_n_ctx_train(const llama_model * model) {
     return model->hparams.n_ctx_train;
 }

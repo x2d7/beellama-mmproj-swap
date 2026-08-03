@@ -719,7 +719,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
-            LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
+            // This is expected (and benign) for M-RoPE multimodal inputs, where the vision
+            // tokens keep the recurrent position at the insertion point; the state is still
+            // updated correctly by the forward pass.
+            LLAMA_LOG_DEBUG("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
                 __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
         cell.pos = last_pos;
@@ -1350,4 +1353,139 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         }
     }
     return (int32_t)(idx * mem->size) + src0;
+}
+
+//
+// mmproj GPU-swap: offload recurrent-state buffers to host RAM and restore to GPU
+//
+
+bool llama_memory_recurrent::offload_to_cpu() {
+    if (rmem_offloaded_) {
+        return true;
+    }
+
+    rmem_offload_staging_.clear();
+    rmem_offload_staging_.reserve(ctxs_bufs.size());
+
+    for (auto & kv : ctxs_bufs) {
+        ggml_context_ptr & ctx = kv.first;
+        ggml_backend_buffer_ptr & buf = kv.second;
+
+        if (!buf) {
+            rmem_offload_staging_.push_back(rmem_offload_staging());
+            continue;
+        }
+
+        const ggml_backend_buffer_type_t gpu_buft = ggml_backend_buffer_get_type(buf.get());
+        const size_t size = ggml_backend_buffer_get_size(buf.get());
+
+        // skip dummy/empty buffers (nothing to move)
+        if (size == 0) {
+            rmem_offload_staging s;
+            s.gpu_buft = gpu_buft;
+            rmem_offload_staging_.push_back(std::move(s));
+            continue;
+        }
+
+        uint8_t * gpu_base = (uint8_t *)ggml_backend_buffer_get_base(buf.get());
+
+        // remember each tensor's offset within the buffer (before we detach it)
+        std::vector<std::pair<struct ggml_tensor *, size_t>> tensors;
+        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            if (t->data == nullptr) continue;
+            tensors.emplace_back(t, (uint8_t *)t->data - gpu_base);
+        }
+
+        // 1) copy current (GPU) contents to a host staging buffer
+        std::vector<uint8_t> data(size);
+        for (auto & p : tensors) {
+            ggml_backend_tensor_get(p.first, data.data() + p.second, 0, ggml_nbytes(p.first));
+        }
+
+        // 2) free the GPU buffer and detach the tensors
+        buf.reset();
+        for (auto & p : tensors) {
+            p.first->buffer = nullptr;
+            p.first->data   = nullptr;
+        }
+
+        // 3) allocate a CPU buffer of the same size and place the tensors at
+        //    their original offsets (preserving the buffer layout)
+        LLAMA_LOG_INFO("%s: offloaded recurrent buffer to CPU: size=%.2f MiB, tensors=%zu\n",
+                __func__, (double)size / 1024.0 / 1024.0, tensors.size());
+        ggml_backend_buffer_t cpu_buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type());
+        if (cpu_buf == nullptr) {
+            LLAMA_LOG_ERROR("%s: failed to allocate CPU buffer for recurrent offload\n", __func__);
+            return false;
+        }
+
+        // 4) copy the host contents into the CPU buffer
+        for (auto & p : tensors) {
+            ggml_backend_tensor_set(p.first, data.data() + p.second, 0, ggml_nbytes(p.first));
+        }
+
+        rmem_offload_staging s;
+        s.gpu_buft = gpu_buft;
+        s.data     = std::move(data);
+        s.tensors  = std::move(tensors);
+        rmem_offload_staging_.push_back(std::move(s));
+
+        buf = ggml_backend_buffer_ptr(cpu_buf);
+    }
+
+    rmem_offloaded_ = true;
+    return true;
+}
+
+bool llama_memory_recurrent::restore_to_gpu() {
+    if (!rmem_offloaded_) {
+        return true;
+    }
+
+    if (rmem_offload_staging_.size() != ctxs_bufs.size()) {
+        LLAMA_LOG_ERROR("%s: staging/cache size mismatch, refusing restore\n", __func__);
+        return false;
+    }
+
+    for (size_t i = 0; i < ctxs_bufs.size(); i++) {
+        ggml_context_ptr & ctx = ctxs_bufs[i].first;
+        ggml_backend_buffer_ptr & buf = ctxs_bufs[i].second;
+        const rmem_offload_staging & s = rmem_offload_staging_[i];
+
+        if (!buf) {
+            continue;
+        }
+
+        // 1) copy current (CPU) contents to host, keyed by the ORIGINAL offsets
+        std::vector<uint8_t> data(s.data.size());
+        for (const auto & p : s.tensors) {
+            ggml_backend_tensor_get(p.first, data.data() + p.second, 0, ggml_nbytes(p.first));
+        }
+
+        // 2) free the CPU buffer and detach tensors
+        buf.reset();
+        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            t->buffer = nullptr;
+            t->data   = nullptr;
+        }
+
+        // 3) reallocate on the original GPU backend
+        ggml_backend_buffer_t gpu_buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), s.gpu_buft);
+        if (gpu_buf == nullptr) {
+            LLAMA_LOG_ERROR("%s: failed to reallocate GPU buffer for recurrent restore\n", __func__);
+            return false;
+        }
+
+        // 4) copy the preserved contents back into the GPU buffer, using the
+        //    original offsets so the new (possibly re-packed) layout is irrelevant
+        for (const auto & p : s.tensors) {
+            ggml_backend_tensor_set(p.first, data.data() + p.second, 0, ggml_nbytes(p.first));
+        }
+
+        buf = ggml_backend_buffer_ptr(gpu_buf);
+    }
+
+    rmem_offload_staging_.clear();
+    rmem_offloaded_ = false;
+    return true;
 }

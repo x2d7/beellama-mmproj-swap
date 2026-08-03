@@ -112,6 +112,10 @@ public:
     llama_memory_i * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    // mmproj GPU-swap: offload/restore the attention KV cache to/from host RAM
+    bool offload_to_cpu() override;
+    bool restore_to_gpu() override;
+
 private:
     const llama_hparams & hparams;
 

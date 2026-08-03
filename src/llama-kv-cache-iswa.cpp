@@ -497,6 +497,24 @@ llama_memory_i * llama_kv_cache_iswa::get_swa() const {
     return kv_swa.get();
 }
 
+bool llama_kv_cache_iswa::offload_to_cpu() {
+    bool ok = true;
+    if (kv_base) {
+        ok = ok && kv_base->offload_to_cpu();
+    }
+    if (kv_swa) {
+        ok = ok && kv_swa->offload_to_cpu();
+    }
+    return ok;
+}
+
+bool llama_kv_cache_iswa::restore_to_gpu() {
+    bool ok = true;
+    if (kv_base) ok = ok && kv_base->restore_to_gpu();
+    if (kv_swa)  ok = ok && kv_swa->restore_to_gpu();
+    return ok;
+}
+
 //
 // llama_kv_cache_iswa_context
 //

@@ -578,6 +578,30 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc);
 }
 
+// Free the underlying VRAM buffers of a gallocr without destroying the
+// allocator itself. The next ggml_gallocr_reserve_n() will re-allocate them.
+void ggml_gallocr_free_buffers(ggml_gallocr_t galloc) {
+    if (galloc == NULL) {
+        return;
+    }
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers == NULL) {
+            continue;
+        }
+        bool freed = false;
+        for (int j = 0; j < i; j++) {
+            if (galloc->buffers[j] == galloc->buffers[i]) {
+                freed = true;
+                break;
+            }
+        }
+        if (!freed && galloc->buffers[i] != NULL) {
+            ggml_vbuffer_free(galloc->buffers[i]);
+        }
+        galloc->buffers[i] = NULL;
+    }
+}
+
 typedef struct ggml_gallocr * ggml_gallocr_t;
 
 static struct hash_node * ggml_gallocr_hash_get(ggml_gallocr_t galloc, struct ggml_tensor * t) {
