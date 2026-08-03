@@ -54,3 +54,6 @@ struct gpu_swap_manager {
     gpu_swap_state get_state() const;
     void print_stats() const;
 };
+
+// Log current VRAM usage and scheduler compute-buffer sizes (diagnostics).
+void gpu_swap_log_vram(const char * tag, struct llama_context * lctx);

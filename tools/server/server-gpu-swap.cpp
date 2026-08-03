@@ -19,7 +19,7 @@
 // of the model weights.
 //
 
-static void log_vram_and_sched(const char * tag, struct llama_context * lctx) {
+void gpu_swap_log_vram(const char * tag, struct llama_context * lctx) {
     size_t free_vram = 0, total_vram = 0;
     ggml_backend_cuda_get_device_memory(0, &free_vram, &total_vram);
     size_t used_vram = total_vram - free_vram;
@@ -92,7 +92,7 @@ bool gpu_swap_manager::swap_to_mmproj_gpu(struct mtmd_context * /*mctx*/,
         return false;
     }
 
-    log_vram_and_sched("before_offload", lctx);
+    gpu_swap_log_vram("before_offload", lctx);
 
     state = gpu_swap_state::TRANSITIONING;
 
@@ -118,7 +118,7 @@ bool gpu_swap_manager::swap_to_mmproj_gpu(struct mtmd_context * /*mctx*/,
         ggml_backend_sched_free_buffers(llama_context_get_sched(lctx));
     }
 
-    log_vram_and_sched("after_offload", lctx);
+    gpu_swap_log_vram("after_offload", lctx);
 
     state = gpu_swap_state::MMPROJ_ON_GPU;
 
@@ -145,7 +145,7 @@ bool gpu_swap_manager::swap_to_model_gpu(struct mtmd_context * /*mctx*/,
         return false;
     }
 
-    log_vram_and_sched("before_restore", lctx);
+    gpu_swap_log_vram("before_restore", lctx);
 
     state = gpu_swap_state::TRANSITIONING;
 
@@ -165,7 +165,7 @@ bool gpu_swap_manager::swap_to_model_gpu(struct mtmd_context * /*mctx*/,
         llama_context_sched_update(lctx);
     }
 
-    log_vram_and_sched("after_restore", lctx);
+    gpu_swap_log_vram("after_restore", lctx);
 
     state = gpu_swap_state::MODEL_ON_GPU;
 

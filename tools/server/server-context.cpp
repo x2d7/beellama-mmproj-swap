@@ -195,6 +195,10 @@ struct server_slot {
     // multimodal
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
+    // image batches left to decode after the mmproj->KV swap-back (see update_slots)
+    std::vector<mtmd::batch_ptr> mtmd_pending_batches;
+    std::vector<size_t> mtmd_pending_chunks;    // chunk slot index per pending batch
+    std::vector<llama_pos> mtmd_pending_poses;  // KV position for each pending batch
 
     // speculative decoding
     common_speculative * spec;
@@ -769,90 +773,81 @@ struct server_slot {
 
     // returns 0 on success
     // caller need to update prompt.tokens after a successful call to keep track of the processing progress
-    int process_mtmd_chunk(size_t idx, size_t & n_tokens_out) {
+    // Encodes the media chunk at idx into a batch that is kept pending (not decoded yet).
+    // The actual KV decode (with the cache restored to GPU) happens later via process_mtmd_batches_decode().
+    int process_mtmd_chunk_encode(size_t idx) {
         GGML_ASSERT(mctx);
         const auto & input_tokens = task->tokens;
         const auto & chunk = input_tokens.find_chunk(idx);
         int32_t res = 0;
 
-        auto try_decode = [&]() -> int32_t {
-            if (mbatch) {
-                float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
-                if (embd) {
-                    void * cb_data = spec;
-                    static auto cb = [](llama_batch batch, void * user_data) {
-                        common_speculative * spec = static_cast<common_speculative *>(user_data);
-                        if (!common_speculative_process(spec, batch)) {
-                            return 1;
-                        }
-                        return 0;
-                    };
+        const llama_pos chunk_pos = prompt.tokens.pos_next();
 
-                    llama_pos new_n_past; // unused for now
-                    res = mtmd_helper_decode_image_chunk(
-                        mctx,
-                        ctx_tgt,
-                        chunk.get(),
-                        embd,
-                        prompt.tokens.pos_next(),
-                        id,
-                        llama_n_batch(ctx_tgt),
-                        &new_n_past,
-                        cb,
-                        cb_data
-                    );
-                    if (res != 0) {
-                        SLT_ERR(*this, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
-                        return -1;
-                    }
-                    n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
-                    return 0; // success
-                }
-            }
-            return 1; // (non-error) need to create & encode batch
-        };
-
-        // if the batch is already exist, try searching & encode
-        res = try_decode();
-        if (res == 0) {
-            return 0;
-        }
-        if (res < 0) {
-            // fatal error
-            return res;
-        }
-
-        // otherwise, the batch is either uninitialized or is used up
-        // we need to create & encode a new batch
-        mbatch.reset(mtmd_batch_init(mctx));
-        res = mtmd_batch_add_chunk(mbatch.get(), chunk.get());
+        auto batch = mtmd::batch_ptr(mtmd_batch_init(mctx));
+        res = mtmd_batch_add_chunk(batch.get(), chunk.get());
         GGML_ASSERT(res == 0); // we should never have an empty batch
-
-        // try batching as much as possible
-        int n_added = 1;
-        size_t idx_cur = idx;
-        while (res == 0) {
-            auto [next_chunk, next_idx] = input_tokens.find_next_media_chunk(idx_cur);
-            if (next_chunk == nullptr) {
-                break;
-            }
-            res = mtmd_batch_add_chunk(mbatch.get(), next_chunk->get());
-            n_added += (res == 0 ? 1 : 0);
-            idx_cur = next_idx;
-            SLT_DBG(*this, "try adding media chunk idx = %zu to batch, res = %d\n", next_idx, res);
-            // if res != 0, batch is full or chunk is not compatible -> this loop breaks
-        }
-
-        // TODO @ngxson : move this log line to debug when it become more stable
-        SLT_TRC(*this, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
-
-        res = mtmd_batch_encode(mbatch.get());
+        res = mtmd_batch_encode(batch.get());
         if (res != 0) {
             SLT_ERR(*this, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
             return -1;
         }
 
-        return try_decode();
+        mtmd_pending_batches.push_back(std::move(batch));
+        mtmd_pending_chunks.push_back(idx);
+        mtmd_pending_poses.push_back(chunk_pos);
+        return 0;
+    }
+
+    // Decodes every deferred image batch, writing the image KV to the (restored) cache.
+    // Returns the total number of output tokens decoded, or 0 on error.
+    int process_mtmd_batches_decode(size_t & n_tokens_out) {
+        GGML_ASSERT(mctx);
+        int32_t res = 0;
+        n_tokens_out = 0;
+        const auto & input_tokens = task->tokens;
+
+        void * cb_data = spec;
+        static auto cb = [](llama_batch batch, void * user_data) {
+            common_speculative * spec = static_cast<common_speculative *>(user_data);
+            if (!common_speculative_process(spec, batch)) {
+                return 1;
+            }
+            return 0;
+        };
+
+        for (size_t i = 0; i < mtmd_pending_batches.size(); ++i) {
+            const auto & batch = mtmd_pending_batches[i];
+            const auto & chunk = input_tokens.find_chunk(mtmd_pending_chunks[i]);
+            float * embd = mtmd_batch_get_output_embd(batch.get(), chunk.get());
+            if (embd) {
+                llama_pos new_n_past; // unused for now
+                res = mtmd_helper_decode_image_chunk(
+                    mctx,
+                    ctx_tgt,
+                    chunk.get(),
+                    embd,
+                    mtmd_pending_poses[i],
+                    id,
+                    llama_n_batch(ctx_tgt),
+                    &new_n_past,
+                    cb,
+                    cb_data
+                );
+                if (res != 0) {
+                    SLT_ERR(*this, "failed to decode mtmd chunk idx = %zu, res = %d\n", mtmd_pending_chunks[i], res);
+                    mtmd_pending_batches.clear();
+                    mtmd_pending_chunks.clear();
+                    mtmd_pending_poses.clear();
+                    return -1;
+                }
+                n_tokens_out += mtmd_input_chunk_get_n_tokens(chunk.get());
+            }
+        }
+
+        mtmd_pending_batches.clear();
+        mtmd_pending_chunks.clear();
+        mtmd_pending_poses.clear();
+        return 0;
     }
 };
 
@@ -1097,10 +1092,13 @@ private:
     }
 
     void reload_mmproj(bool use_gpu) {
+        gpu_swap_log_vram("mmproj_before_free", ctx_tgt);
         mtmd_free(mctx);
         mctx = nullptr;
+        gpu_swap_log_vram("mmproj_after_free", ctx_tgt);
         auto mparams = make_mmproj_params(use_gpu);
         mctx = mtmd_init_from_file(params_base.mmproj.path.c_str(), model_tgt, mparams);
+        gpu_swap_log_vram("mmproj_after_init", ctx_tgt);
         for (server_slot & slot : slots) {
             slot.mctx = mctx;
         }
@@ -3819,17 +3817,14 @@ private:
                             break;
                         }
 
-                        // process the image
-                        size_t n_tokens_out = 0;
-                        int32_t res = slot.process_mtmd_chunk(cur_token_idx, n_tokens_out);
+                        // encode the image (decode is deferred until the KV cache is restored to GPU)
+                        int32_t res = slot.process_mtmd_chunk_encode(cur_token_idx);
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
                             slot.release();
                             continue;
                         }
-
-                        slot.n_prompt_tokens_processed += n_tokens_out;
 
                         // add the image chunk to cache
                         {
@@ -3840,11 +3835,15 @@ private:
                         has_mtmd = true;
                     }
 
-                    // swap mmproj back to CPU after image encoding. Keep mmproj on the GPU
-                    // (and the KV cache offloaded) across all media chunks of this task, so a
-                    // multi-image request performs a single swap cycle instead of one per batch.
+                    // swap mmproj back to CPU (and restore the KV cache to GPU) as soon as the
+                    // run of consecutive media chunks is consumed and the next token is text.
+                    // Keeping the KV offloaded across an interleaved text run decodes that run
+                    // with the cache on CPU, which is ~10x slower. A run of consecutive images
+                    // still performs a single swap cycle because the while() loop above consumes
+                    // the whole run before this check runs.
                     if (mmproj_is_on_gpu &&
-                        input_tokens.find_next_media_chunk(slot.prompt.n_tokens()).first == nullptr) {
+                        (slot.prompt.n_tokens() >= slot.task->n_tokens() ||
+                         input_tokens[slot.prompt.n_tokens()] != LLAMA_TOKEN_NULL)) {
                         SRV_INF("%s", "[mtmd] swapping mmproj back to CPU\n");
                         reload_mmproj(false);
                         if (!mctx) {
@@ -3852,8 +3851,23 @@ private:
                         } else {
                             mmproj_is_on_gpu = false;
                         }
-                        SRV_INF("%s", "[mtmd] restoring KV cache buffers to GPU\n");
+SRV_INF("%s", "[mtmd] restoring KV cache buffers to GPU\n");
                         swap_mgr.swap_to_model_gpu(mctx, model_tgt, ctx_tgt);
+                    }
+
+                    // decode any image batches encoded above now that the KV cache is back on the GPU.
+                    // KVarN attention has no CPU path, so decoding with the cache offloaded would force
+                    // the scheduler to copy the whole KV cache into the CUDA compute buffer (O(H on large ctx)).
+                    if (has_mtmd) {
+                        size_t n_image_tokens = 0;
+                        int32_t res_decode = slot.process_mtmd_batches_decode(n_image_tokens);
+                        if (res_decode != 0) {
+                            SLT_ERR(slot, "failed to decode image, res = %d\n", res_decode);
+                            send_error(slot, "failed to decode image", ERROR_TYPE_SERVER);
+                            slot.release();
+                            return;
+                        }
+                        slot.n_prompt_tokens_processed += n_image_tokens;
                     }
 
                     const auto & spans = slot.task->params.message_spans;
