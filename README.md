@@ -1,5 +1,7 @@
 # Anbeeld's BeeLlama.cpp
 
+> Enables **`--mmproj-gpu-swap`** (offload KV cache to host RAM during image encoding, load mmproj on GPU only on demand). The same swap mechanism also works in my turboquant fork: [x2d7/llama-cpp-tq-mmproj-swap](https://github.com/x2d7/llama-cpp-tq-mmproj-swap).
+
 ![BeeLlama.cpp logo](beellama.jpg)
 
 BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing more speed and context out of local GGUF inference. It adds variance-normalized KV-cache quantization (KVarN), KV cache precision tail for recent tokens, low-bit cache types, adaptive draft control for speculative decoding, reasoning-loop protection, and more.
