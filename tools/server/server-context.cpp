@@ -202,6 +202,8 @@ struct server_slot {
     // set once all remaining image chunks of the current task have been encoded
     // in a single mmproj swap cycle (see update_slots)
     bool mtmd_pre_encoded = false;
+    int32_t n_mtmd_total = 0;        // total image chunks of the current task, for progress
+    double t_mtmd_decode_ms = 0.0;   // cumulative image decode time, for progress
 
     // speculative decoding
     common_speculative * spec;
@@ -269,6 +271,8 @@ struct server_slot {
         mtmd_pending_chunks.clear();
         mtmd_pending_poses.clear();
         mtmd_pre_encoded = false;
+        n_mtmd_total = 0;
+        t_mtmd_decode_ms = 0.0;
     }
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -412,6 +416,8 @@ struct server_slot {
         mtmd_pending_chunks.clear();
         mtmd_pending_poses.clear();
         mtmd_pre_encoded = false;
+        n_mtmd_total = 0;
+        t_mtmd_decode_ms = 0.0;
     }
 
     void init_sampler() const {
@@ -674,6 +680,16 @@ struct server_slot {
 
         SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.2f, t = %6.2f s / %.2f tokens per second\n",
                 n_prompt_tokens_processed, f_progress, t_prompt_processing / 1e3, n_prompt_second);
+    }
+
+    void print_timing_mtmd_enc(int32_t n_done, int32_t n_total, double t_ms) const {
+        SLT_INF(*this, "image encoding, n_images = %d/%d, t = %6.2f s / %.2f images per second\n",
+                n_done, n_total, t_ms / 1e3, n_done / t_ms * 1e3);
+    }
+
+    void print_timing_mtmd_dec(int32_t n_done, int32_t n_total, double t_ms) const {
+        SLT_INF(*this, "image decoding, n_images = %d/%d, t = %6.2f s / %.2f images per second\n",
+                n_done, n_total, t_ms / 1e3, n_done / t_ms * 1e3);
     }
 
     void print_timings() const {
@@ -3817,7 +3833,20 @@ private:
                         slot.prompt.n_tokens() < slot.task->n_tokens() &&
                         input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
 
+                        // total number of image chunks left in the task, for progress reporting
+                        slot.n_mtmd_total = 0;
+                        for (size_t j = slot.prompt.n_tokens(); j < (size_t) slot.task->n_tokens();) {
+                            if (input_tokens[j] == LLAMA_TOKEN_NULL) {
+                                slot.n_mtmd_total++;
+                                j += mtmd_input_chunk_get_n_tokens(input_tokens.find_chunk(j).get());
+                            } else {
+                                j++;
+                            }
+                        }
+
                         // swap mmproj to GPU for image encoding (kept on CPU otherwise)
+                        // (t_enc0 covers the swap too, so the progress reflects the real wait)
+                        const int64_t t_enc0 = ggml_time_us();
                         if (mmproj_gpu_swap && !mmproj_is_on_gpu) {
                             SRV_INF("%s", "[mtmd] freeing KV cache buffers to free VRAM for mmproj\n");
                             swap_mgr.swap_to_mmproj_gpu(mctx, model_tgt, ctx_tgt);
@@ -3836,6 +3865,7 @@ private:
                         // is derived from the task token stream, matching server_tokens::pos_next
                         // semantics for the point where the chunk's image KV will be written
                         bool encode_ok = true;
+                        int32_t n_encoded = 0;
                         size_t idx = slot.prompt.n_tokens();
                         while (idx < (size_t) slot.task->n_tokens()) {
                             if (input_tokens[idx] == LLAMA_TOKEN_NULL) {
@@ -3847,6 +3877,8 @@ private:
                                     encode_ok = false;
                                     break;
                                 }
+                                n_encoded++;
+                                slot.print_timing_mtmd_enc(n_encoded, slot.n_mtmd_total, (ggml_time_us() - t_enc0) / 1e3);
                                 idx += mtmd_input_chunk_get_n_tokens(chunk.get());
                             } else {
                                 idx++;
@@ -3903,13 +3935,18 @@ private:
                         // force the scheduler to copy the whole KV cache into the CUDA compute buffer
                         // (O(H on large ctx)).
                         size_t n_image_tokens = 0;
+                        const int64_t t_dec0 = ggml_time_us();
                         int32_t res_decode = slot.process_mtmd_batches_decode(cur_token_idx, n_image_tokens);
+                        slot.t_mtmd_decode_ms += (ggml_time_us() - t_dec0) / 1e3;
                         if (res_decode != 0) {
                             SLT_ERR(slot, "failed to decode image, res = %d\n", res_decode);
                             send_error(slot, "failed to decode image", ERROR_TYPE_SERVER);
                             slot.release();
                             return;
                         }
+                        slot.print_timing_mtmd_dec(
+                                slot.n_mtmd_total - (int32_t) slot.mtmd_pending_chunks.size(),
+                                slot.n_mtmd_total, slot.t_mtmd_decode_ms);
                         slot.n_prompt_tokens_processed += n_image_tokens;
 
                         has_mtmd = true;
