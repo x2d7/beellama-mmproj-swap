@@ -453,8 +453,8 @@ private:
     // mmproj GPU-swap: host-side staging for offloaded KV buffers (parallel to ctxs_bufs)
     struct kv_offload_staging {
         ggml_backend_buffer_type_t                                  gpu_buft = nullptr; // original (GPU) buffer type
-        std::vector<uint8_t>                                        data;              // full buffer contents
-        std::vector<std::pair<struct ggml_tensor *, size_t>>        tensors;           // (tensor, offset within data) snapshot
+        size_t                                                      size = 0;           // original (GPU) buffer size in bytes
+        std::vector<std::pair<struct ggml_tensor *, size_t>>        tensors;           // (tensor, offset within buffer) snapshot
     };
     std::vector<kv_offload_staging> kv_offload_staging_;
     bool                           kv_offloaded_ = false;

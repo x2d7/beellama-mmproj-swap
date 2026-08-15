@@ -6778,7 +6778,7 @@ bool llama_kv_cache::offload_to_cpu() {
 
         kv_offload_staging s;
         s.gpu_buft = gpu_buft;
-        s.data     = std::move(data);
+        s.size     = size;
         s.tensors  = std::move(tensors);
         kv_offload_staging_.push_back(std::move(s));
 
@@ -6809,7 +6809,7 @@ bool llama_kv_cache::restore_to_gpu() {
         }
 
         // 1) copy current (CPU) KV contents to host, keyed by the ORIGINAL offsets
-        std::vector<uint8_t> data(s.data.size());
+        std::vector<uint8_t> data(s.size);
         for (const auto & p : s.tensors) {
             ggml_backend_tensor_get(p.first, data.data() + p.second, 0, ggml_nbytes(p.first));
         }
