@@ -636,6 +636,13 @@ struct llama_model {
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
 
+    // mmproj GPU-swap: evict/restore the swappable weight slice (see
+    // llama_model_params.mmproj_swap_reserve_mb). offload frees the dedicated
+    // buffer (tensors leave VRAM); restore reloads them from the model file.
+    bool swap_weights_offload();
+    bool swap_weights_restore();
+    size_t swap_weights_size() const;
+
     explicit llama_model(const llama_model_params & params);
     virtual ~llama_model();
 

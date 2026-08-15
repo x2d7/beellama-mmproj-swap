@@ -2812,6 +2812,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--mmproj-gpu-swap-reserve-mb"}, "N",
+        string_format("MiB of the main-model weights to keep in a dedicated swappable CUDA buffer (only used with\n"
+        "--mmproj-gpu-swap). Those weights are evicted from VRAM while the vision projector is on the\n"
+        "GPU for image encoding, and reloaded from disk afterwards. Approximate: whole layers are picked\n"
+        "from the end of the model until at least N MiB are reserved (default: %d)",
+        params.mmproj_swap_reserve_mb),
+        [](common_params & params, int value) {
+            params.mmproj_swap_reserve_mb = std::max(0, value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MMPROJ_GPU_SWAP_RESERVE_MB"));
+    add_opt(common_arg(
         {"--image", "--audio", "--video"}, "FILE",
         "path to an image, audio, or video file. use with multimodal models, use comma-separated values for multiple files\n",
         [](common_params & params, const std::string & value) {

@@ -354,8 +354,15 @@ extern "C" {
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
 
-        // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
+        // The GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
+
+        // How many MiB of the model weights to keep in a dedicated "swappable"
+        // CUDA buffer (a separate buffer type, so it can be freed independently).
+        // During an mmproj GPU-swap cycle those weights are evicted from VRAM
+        // while the vision projector is on the GPU, then reloaded from disk.
+        // 0 disables the slice (all weights in the normal buffers).
+        int32_t mmproj_swap_reserve_mb;
 
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
@@ -661,6 +668,16 @@ extern "C" {
     // the vision encoder fits on the device during image encoding.
     LLAMA_API bool llama_kv_cache_offload_to_cpu(struct llama_context * ctx);
     LLAMA_API bool llama_kv_cache_restore_to_gpu(struct llama_context * ctx);
+
+    // mmproj GPU-swap: evict/restore the swappable weight slice of the model.
+    // offload frees the dedicated slice buffer (tensors leave VRAM), restore
+    // reloads the tensors from the model file and re-uploads them. Callers must
+    // reset the scheduler (llama_context_sched_update) after either call.
+    LLAMA_API bool llama_model_swap_weights_offload(struct llama_model * model);
+    LLAMA_API bool llama_model_swap_weights_restore(struct llama_model * model);
+
+    // Size in bytes of the swappable weight slice (0 if the slice is disabled).
+    LLAMA_API size_t llama_model_swap_weights_size(struct llama_model * model);
 
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,

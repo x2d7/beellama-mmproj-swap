@@ -1044,6 +1044,7 @@ struct llama_model::impl {
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+    buft_list_t swap_buft_list;
 
     struct layer_dev {
         ggml_backend_dev_t dev;
@@ -1053,6 +1054,16 @@ struct llama_model::impl {
     layer_dev dev_input = {};
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
+
+    // swappable weight slice (mmproj GPU-swap): a dedicated CUDA buffer holding
+    // the last few layers of the model. It is freed during image encoding and
+    // reloaded from the model file afterwards.
+    ggml_backend_buffer_type_t swap_weights_buft = nullptr;
+    ggml_backend_buffer_t swap_weights_buf = nullptr;
+    ggml_context * swap_weights_ctx = nullptr;
+    std::vector<std::pair<std::string, std::pair<uint16_t, size_t>>> swap_weights_reload; // name -> {file idx, file offset}
+    std::vector<std::string> swap_files_paths;
+    size_t swap_weights_size = 0;
 
     bool has_tensor_overrides;
 
@@ -1335,6 +1346,65 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+    // --- mmproj GPU-swap weight slice ---
+    // Keep `mmproj_swap_reserve_mb` MiB of the model weights in a dedicated CUDA
+    // buffer so they can be evicted from VRAM while the vision projector is on
+    // the GPU for image encoding. We pick whole repeating layers from the end of
+    // the model whose combined size approximates the requested amount.
+    int n_swap_layers = 0;
+    if (params.mmproj_swap_reserve_mb > 0 && !devices.empty()) {
+        const size_t swap_target = (size_t) params.mmproj_swap_reserve_mb * 1024 * 1024;
+
+        // per-layer weight sizes, computed from the file metadata
+        std::vector<size_t> layer_bytes(n_layer_all, 0);
+        for (const auto & it : ml.weights_map) {
+            int il = -1;
+            if (sscanf(it.first.c_str(), "blk.%d.", &il) != 1 || il < 0 || il >= n_layer_all) {
+                continue;
+            }
+            layer_bytes[il] += ggml_nbytes(it.second.tensor);
+        }
+
+        size_t accum = 0;
+        for (int il = n_layer_all - 1; il >= 1 && accum < swap_target; --il) {
+            accum += layer_bytes[il];
+            n_swap_layers++;
+        }
+        // always keep at least one repeating layer in the main buffer
+        n_swap_layers = std::min(n_swap_layers, n_layer_all - 1);
+
+        if (n_swap_layers > 0) {
+            // resolve the CUDA "swappable" buffer type via the backend reg so this
+            // file stays portable (no direct dependency on ggml-cuda.h)
+            ggml_backend_dev_t swap_dev = devices[0].dev;
+            ggml_backend_reg_t swap_reg = ggml_backend_dev_backend_reg(swap_dev);
+            size_t swap_dev_index = 0;
+            if (swap_reg) {
+                for (size_t i = 0; i < ggml_backend_reg_dev_count(swap_reg); ++i) {
+                    if (ggml_backend_reg_dev_get(swap_reg, i) == swap_dev) {
+                        swap_dev_index = i;
+                        break;
+                    }
+                }
+                auto fn = (ggml_backend_buffer_type_t (*)(int))
+                    ggml_backend_reg_get_proc_address(swap_reg, "ggml_backend_cuda_buffer_type_swappable");
+                if (fn) {
+                    pimpl->swap_weights_buft = fn(swap_dev_index);
+                }
+            }
+            if (pimpl->swap_weights_buft) {
+                pimpl->swap_buft_list.clear();
+                pimpl->swap_buft_list.emplace_back(swap_dev, pimpl->swap_weights_buft);
+                pimpl->swap_buft_list.insert(pimpl->swap_buft_list.end(),
+                        pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
+                LLAMA_LOG_INFO("%s: mmproj GPU-swap: keeping last %d layers (%.0f MiB) in a swappable CUDA buffer\n",
+                        __func__, n_swap_layers, (double) accum / 1024.0 / 1024.0);
+            } else {
+                n_swap_layers = 0;
+            }
+        }
+    }
+
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
@@ -1343,6 +1413,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
+        if (n_swap_layers > 0 && il >= n_layer_all - n_swap_layers) {
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to swappable device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
+            return {dev, &pimpl->swap_buft_list};
+        }
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
@@ -1639,6 +1713,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
 
         ctx_buf_maps.emplace_back(ctx, buf_map);
+    }
+
+    // remember the dedicated swappable weight buffer and the file offsets of its
+    // tensors, so the mmproj GPU-swap can evict it from VRAM and reload it later
+    if (pimpl->swap_weights_buft) {
+        for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+            for (auto & buf : bufs) {
+                if (ggml_backend_buffer_get_type(buf.get()) == pimpl->swap_weights_buft) {
+                    pimpl->swap_weights_buf = buf.get();
+                    pimpl->swap_weights_ctx = ctx.get();
+                    pimpl->swap_weights_size = ggml_backend_buffer_get_size(buf.get());
+                    break;
+                }
+            }
+        }
+        if (pimpl->swap_weights_ctx) {
+            for (ggml_tensor * t = ggml_get_first_tensor(pimpl->swap_weights_ctx); t != nullptr;
+                    t = ggml_get_next_tensor(pimpl->swap_weights_ctx, t)) {
+                auto it = ml.weights_map.find(t->name);
+                if (it != ml.weights_map.end()) {
+                    pimpl->swap_weights_reload.emplace_back(
+                            std::string(t->name), std::make_pair(it->second.idx, it->second.offs));
+                }
+            }
+            pimpl->swap_files_paths = ml.file_paths;
+            LLAMA_LOG_INFO("%s: mmproj GPU-swap: swappable weight slice = %.2f MiB, %zu tensors\n",
+                    __func__, (double) pimpl->swap_weights_size / 1024.0 / 1024.0, pimpl->swap_weights_reload.size());
+        }
     }
 
     if (llama_supports_gpu_offload()) {
@@ -2466,6 +2568,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_MMAP,
         /*.main_gpu                    =*/ 0,
+        /*.mmproj_swap_reserve_mb      =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
@@ -2511,6 +2614,119 @@ struct ggml_tensor * llama_model_get_tensor(struct llama_model * model, const ch
             });
     if (it == model->tensors_by_name.end()) return nullptr;
     return it->second;
+}
+
+// mmproj GPU-swap: free the swappable weight slice from VRAM
+bool llama_model::swap_weights_offload() {
+    if (!pimpl || !pimpl->swap_weights_buf) {
+        return true; // nothing to evict
+    }
+    for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        for (auto & buf : bufs) {
+            if (buf && ggml_backend_buffer_get_type(buf.get()) == pimpl->swap_weights_buft) {
+                buf.reset();
+            }
+        }
+    }
+    for (ggml_tensor * t = ggml_get_first_tensor(pimpl->swap_weights_ctx); t != nullptr;
+            t = ggml_get_next_tensor(pimpl->swap_weights_ctx, t)) {
+        t->buffer = nullptr;
+        t->data   = nullptr;
+    }
+    pimpl->swap_weights_buf = nullptr;
+    LLAMA_LOG_INFO("%s: evicted %.2f MiB of swappable weights from VRAM\n",
+            __func__, (double) pimpl->swap_weights_size / 1024.0 / 1024.0);
+    return true;
+}
+
+// mmproj GPU-swap: reload the swappable weight slice from the model file
+bool llama_model::swap_weights_restore() {
+    if (!pimpl || !pimpl->swap_weights_buft || !pimpl->swap_weights_ctx) {
+        return true;
+    }
+    if (pimpl->swap_weights_buf) {
+        return true; // already resident
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(
+            pimpl->swap_weights_ctx, pimpl->swap_weights_buft);
+    if (buf == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to reallocate the swappable weight buffer\n", __func__);
+        return false;
+    }
+    pimpl->swap_weights_buf = buf;
+
+    // put the buffer back into its ctxs_bufs slot so the model owns it and a
+    // subsequent offload finds it again
+    for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        if (ctx.get() != pimpl->swap_weights_ctx) {
+            continue;
+        }
+        for (auto & b : bufs) {
+            if (!b) {
+                b.reset(buf);
+                break;
+            }
+        }
+        break;
+    }
+
+    // map tensor name -> {file idx, file offset}
+    std::unordered_map<std::string, std::pair<uint16_t, size_t>> reload;
+    for (const auto & it : pimpl->swap_weights_reload) {
+        reload[it.first] = it.second;
+    }
+
+    // open the distinct model files referenced by the slice
+    std::vector<std::unique_ptr<llama_file>> files;
+    std::unordered_map<uint16_t, size_t> file_pos;
+    for (const auto & it : reload) {
+        const uint16_t idx = it.second.first;
+        if (file_pos.find(idx) != file_pos.end()) {
+            continue;
+        }
+        if (idx >= pimpl->swap_files_paths.size()) {
+            LLAMA_LOG_ERROR("%s: swappable tensor '%s' references file %u but only %zu paths known\n",
+                    __func__, it.first.c_str(), idx, pimpl->swap_files_paths.size());
+            return false;
+        }
+        files.emplace_back(new llama_file(pimpl->swap_files_paths[idx].c_str(), "rb"));
+        file_pos[idx] = files.size() - 1;
+    }
+
+    for (ggml_tensor * t = ggml_get_first_tensor(pimpl->swap_weights_ctx); t != nullptr;
+            t = ggml_get_next_tensor(pimpl->swap_weights_ctx, t)) {
+        auto it = reload.find(t->name);
+        if (it == reload.end()) {
+            GGML_ABORT("swappable tensor '%s' has no reload info", t->name);
+        }
+        auto & file = files[file_pos[it->second.first]];
+        const size_t n = ggml_nbytes(t);
+        std::vector<uint8_t> data(n);
+        file->seek(it->second.second, SEEK_SET);
+        file->read_raw(data.data(), n);
+        ggml_backend_tensor_set(t, data.data(), 0, n);
+    }
+
+    LLAMA_LOG_INFO("%s: reloaded %.2f MiB of swappable weights to VRAM\n",
+            __func__, (double) pimpl->swap_weights_size / 1024.0 / 1024.0);
+    return true;
+}
+
+size_t llama_model::swap_weights_size() const {
+    return pimpl ? pimpl->swap_weights_size : 0;
+}
+
+bool llama_model_swap_weights_offload(struct llama_model * model) {
+    return model ? model->swap_weights_offload() : true;
+}
+
+bool llama_model_swap_weights_restore(struct llama_model * model) {
+    return model ? model->swap_weights_restore() : true;
+}
+
+size_t llama_model_swap_weights_size(struct llama_model * model) {
+    return model ? model->swap_weights_size() : 0;
 }
 
 int32_t llama_model_n_ctx_train(const llama_model * model) {

@@ -665,6 +665,7 @@ struct common_params {
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;     // use GPU for multimodal model
     bool mmproj_gpu_swap = false;   // swap mmproj VRAM on vision requests (keep mmproj on CPU, load to GPU only for encode)
+    int32_t mmproj_swap_reserve_mb = 0; // MiB of main-model weights to keep in a dedicated swappable CUDA buffer (with mmproj_gpu_swap)
     bool no_mmproj = false;         // explicitly disable multimodal model
     std::vector<std::string> image; // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
