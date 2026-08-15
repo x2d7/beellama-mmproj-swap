@@ -1,6 +1,10 @@
 # Anbeeld's BeeLlama.cpp
 
-> Enables **`--mmproj-gpu-swap`** (offload KV cache to host RAM during image encoding, load mmproj on GPU only on demand). The same swap mechanism also works in my turboquant fork: [x2d7/llama-cpp-tq-mmproj-swap](https://github.com/x2d7/llama-cpp-tq-mmproj-swap).
+> **Changes from the base repository.** This fork adds the following on top of the base BeeLlama.cpp:
+>
+> - **`--mmproj-gpu-swap`** — the vision projector stays on CPU and is uploaded to VRAM only while images are being encoded; the KV cache temporarily moves to host RAM to make room. All images from the request are encoded during a single swap cycle — no repeated offload/restore mid-batch.
+> - **Swappable weight slice** (`--mmproj-gpu-swap-reserve-mb`) — a slice of the main-model weights lives in a dedicated buffer that is evicted from VRAM during image encoding and reloaded from disk afterwards, so even a model that barely fits can still serve images without an encoder OOM.
+> - **Image progress logs** — multi-image batches report `image encoding, n_images = 1/5 … 5/5` and `image decoding, …` in the server's `print_timing` style instead of silence.
 
 ![BeeLlama.cpp logo](beellama.jpg)
 
