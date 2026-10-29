@@ -119,6 +119,9 @@ struct llama_model_loader {
     llama_ftype ftype;
     llama_fver  fver;
 
+    // paths of the opened model files, index-aligned with `files`
+    std::vector<std::string> file_paths;
+
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;

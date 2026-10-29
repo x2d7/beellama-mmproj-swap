@@ -459,6 +459,9 @@ struct mtmd_input_chunks {
 
 struct mtmd_batch {
     mtmd_context * ctx;
+    size_t n_embd_out = 0; // output embedding dimension, captured at init: the context may be
+                           // freed and recreated after encoding (e.g. mmproj GPU swap), so the
+                           // batch must not dereference ctx once encoding is done
     std::vector<const mtmd_input_chunk *> entries;
     std::vector<float> output_embd; // aggregated output embedding for the whole batch
     mtmd_batch(mtmd_context * ctx): ctx(ctx) {}
@@ -1209,7 +1212,11 @@ std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::
             continue; // text part
         }
         const bool has_next = n_merge > 1 && i + 1 < parts.size() && parts[i + 1].bitmap != nullptr;
-        if (has_next && parts[i].bitmap->can_merge_with(*parts[i + 1].bitmap)) {
+        // only merge frames originating from the same video (lazy) source:
+        // parts with different non-zero merge groups never merge
+        const bool same_group = parts[i].merge_group == 0 || parts[i + 1].merge_group == 0 ||
+            parts[i].merge_group == parts[i + 1].merge_group;
+        if (has_next && same_group && parts[i].bitmap->can_merge_with(*parts[i + 1].bitmap)) {
             LOG_DBG("%s: merging 2 frames at part index %zu and %zu\n", __func__, i, i + 1);
             output.push_back({parts[i].bitmap, parts[i + 1].bitmap});
             parts.erase(parts.begin() + i + 1);
@@ -1230,6 +1237,9 @@ struct mtmd_tokenizer {
     const llama_vocab * vocab;
 
     using part = mtmd_internal_part;
+    // Incremented for every lazy (video) bitmap so that frames from different
+    // videos never share a merge group.
+    int next_lazy_group = 0;
     std::vector<part> parts;
     // these will be freed when mtmd_tokenizer finishes
     std::vector<mtmd::bitmap> bm_from_lazy; // TODO @ngxson : refactor, free bm_from_lazy progressively
@@ -1308,6 +1318,7 @@ struct mtmd_tokenizer {
         for (auto & p : parts) {
             if (p.bitmap != nullptr && p.bitmap->lazy_callback) {
                 LOG_DBG("%s: expanding lazy bitmap\n", __func__);
+                const int group = ++next_lazy_group;
                 for (size_t i = 0;; i++) {
                     char * out_str = nullptr;
                     mtmd_bitmap * out_bm = nullptr;
@@ -1322,7 +1333,7 @@ struct mtmd_tokenizer {
                         // OK, append the returned chunk; lazy part is not yet added
                         if (out_bm) {
                             auto & ptr = bm_from_lazy.emplace_back(out_bm); // remember to free it later
-                            expanded.push_back({"", ptr.ptr.get()});
+                            expanded.push_back({"", ptr.ptr.get(), false, group});
                             LOG_DBG("%s: lazy callback returned bitmap with dimensions %d x %d\n", __func__, out_bm->nx, out_bm->ny);
                         } else if (out_str) {
                             auto & ptr = text_from_lazy.emplace_back(out_str); // remember to free it later
@@ -2291,7 +2302,12 @@ int32_t mtmd_gen_audio_process(mtmd_context * ctx, mtmd_gen_state * state, const
 }
 
 mtmd_batch * mtmd_batch_init(mtmd_context * ctx) {
-    return new mtmd_batch(ctx);
+    mtmd_batch * batch = new mtmd_batch(ctx);
+    // capture the output embedding dimension while the context is alive; it must not
+    // be read from ctx later because the context can be freed and recreated after
+    // encoding (e.g. mmproj GPU swap) while decoded batches are still pending
+    batch->n_embd_out = (size_t) ctx->n_embd_out();
+    return batch;
 }
 
 void mtmd_batch_free(mtmd_batch * batch) {
@@ -2404,7 +2420,7 @@ float * mtmd_batch_get_output_embd(mtmd_batch * batch, const mtmd_input_chunk * 
         return nullptr;
     }
     size_t offset = 0;
-    const size_t n_embd = batch->ctx->n_embd_out();
+    const size_t n_embd = batch->n_embd_out;
     for (const auto * c : batch->entries) {
         size_t offset_prev = offset;
         size_t n_tokens = mtmd_input_chunk_get_n_tokens(c);

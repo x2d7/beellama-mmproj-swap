@@ -1359,6 +1359,15 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+void llama_context::sched_release() {
+    sched_need_reserve = true;
+    // Reset clears tensor backend assignments; sched_reserve re-estimates them.
+    if (sched) {
+        ggml_backend_sched_reset(sched.get());
+    }
+    sched_reserve();
+}
+
 void llama_context::record_backend_private_workspace(ggml_cgraph * gf) {
     using workspace_size_fn = size_t (*)(ggml_backend_dev_t, const ggml_tensor *);
     if (gf == nullptr) {
@@ -1448,6 +1457,32 @@ const llama_cparams & llama_context::get_cparams() const {
 
 ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
+}
+
+// Reset the backend scheduler to re-evaluate backend assignments for tensors
+// Used after GPU swap operations to update tensor location tracking
+void llama_context_sched_update(struct llama_context * ctx) {
+    if (!ctx) return;
+    ctx->sched_release();
+}
+
+ggml_backend_sched_t llama_context_get_sched(struct llama_context * ctx) {
+    if (!ctx) return nullptr;
+    return ctx->get_sched();
+}
+
+ggml_backend_t llama_context_get_cpu_backend(struct llama_context * ctx) {
+    if (!ctx) return nullptr;
+    ggml_backend_sched_t sched = ctx->get_sched();
+    if (!sched) return nullptr;
+    const int n = ggml_backend_sched_get_n_backends(sched);
+    for (int i = 0; i < n; i++) {
+        ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+        if (b && ggml_backend_dev_type(ggml_backend_get_device(b)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return b;
+        }
+    }
+    return nullptr;
 }
 
 uint32_t llama_context::n_ctx() const {
@@ -5631,6 +5666,29 @@ size_t llama_state_get_data_ext(
 // Sets the state reading from the specified source address
 size_t llama_state_set_data(llama_context * ctx, const uint8_t * src, size_t size) {
     return llama_state_set_data_ext(ctx, src, size, 0);
+}
+
+// mmproj GPU-swap: offload/restore the KV cache buffers to/from host RAM
+bool llama_kv_cache_offload_to_cpu(struct llama_context * ctx) {
+    if (!ctx) {
+        return false;
+    }
+    llama_memory_t mem = ctx->get_memory();
+    if (!mem) {
+        return false;
+    }
+    return mem->offload_to_cpu();
+}
+
+bool llama_kv_cache_restore_to_gpu(struct llama_context * ctx) {
+    if (!ctx) {
+        return false;
+    }
+    llama_memory_t mem = ctx->get_memory();
+    if (!mem) {
+        return false;
+    }
+    return mem->restore_to_gpu();
 }
 
 size_t llama_state_set_data_ext(

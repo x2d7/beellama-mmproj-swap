@@ -57,6 +57,7 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+    void sched_release();
     void record_backend_private_workspace(ggml_cgraph * gf);
 
     void synchronize();

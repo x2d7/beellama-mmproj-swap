@@ -2000,6 +2000,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--rs-rollback"}, "N",
+        string_format("number of recurrent-state snapshots per sequence (default: %d, 0 = disabled)\n"
+            "enables prompt-cache rollback for hybrid/recurrent models (Qwen3.5/3.8, Nemotron-H, ...).\n"
+            "each snapshot costs one recurrent-state buffer per layer, so VRAM grows by N x state size;\n"
+            "use it when a restored/cached prompt must be reused without a full re-prefill", params.rs_rollback),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 64) {
+                throw std::invalid_argument("rs-rollback must be between 0 and 64");
+            }
+            params.rs_rollback = value;
+        }
+    ).set_env("LLAMA_ARG_RS_ROLLBACK").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
@@ -2940,6 +2953,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.mmproj_use_gpu = value;
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
+    add_opt(common_arg(
+        {"--mmproj-gpu-swap"},
+        "temporarily load mmproj to GPU only for image encoding, then move it back to CPU\n"
+        "(useful when mmproj does not fit in VRAM alongside the model)",
+        [](common_params & params) {
+            params.mmproj_gpu_swap = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--mmproj-gpu-swap-reserve-mb"}, "N",
+        string_format("MiB of the main-model weights to keep in a dedicated swappable CUDA buffer (only used with\n"
+        "--mmproj-gpu-swap). Those weights are evicted from VRAM while the vision projector is on the\n"
+        "GPU for image encoding, and reloaded from disk afterwards. Approximate: whole layers are picked\n"
+        "from the end of the model until at least N MiB are reserved (default: %d)",
+        params.mmproj_swap_reserve_mb),
+        [](common_params & params, int value) {
+            params.mmproj_swap_reserve_mb = std::max(0, value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MMPROJ_GPU_SWAP_RESERVE_MB"));
     add_opt(common_arg(
         // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
         {"-mmdev", "--mmproj-device"}, "DEVICE",

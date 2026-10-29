@@ -27,6 +27,13 @@ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 
+// A distinct CUDA buffer type used for the mmproj GPU-swap weight slice.
+// Buffers from this type are separate cudaMalloc allocations (never part of
+// the shared compute pool), so freeing one reliably returns its VRAM to the
+// driver. Used to temporarily evict a slice of the main-model weights from
+// VRAM while the vision projector is on the GPU for image encoding.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type_swappable(int device);
+
 // conduct allreduce operation between devices
 GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
 

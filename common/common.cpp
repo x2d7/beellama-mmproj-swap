@@ -1873,6 +1873,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    mparams.mmproj_swap_reserve_mb = params.mmproj_gpu_swap ? params.mmproj_swap_reserve_mb : 0;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1901,7 +1902,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
-    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    cparams.n_rs_seq          = std::max<uint32_t>(params.speculative.need_n_rs_seq(), (uint32_t) std::max(0, params.rs_rollback));
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;

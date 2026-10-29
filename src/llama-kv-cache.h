@@ -194,6 +194,11 @@ public:
             llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
             slot_info_vec_t * sinfos_out, const slot_info_vec_t * sinfos_in);
 
+    // mmproj GPU-swap: offload the KV cache buffers to host RAM (freeing VRAM)
+    // and restore them to the GPU.
+    bool offload_to_cpu() override;
+    bool restore_to_gpu() override;
+
     //
     // llama_kv_cache specific API
     //
@@ -503,6 +508,15 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // mmproj GPU-swap: host-side staging for offloaded KV buffers (parallel to ctxs_bufs)
+    struct kv_offload_staging {
+        ggml_backend_buffer_type_t                                  gpu_buft = nullptr; // original (GPU) buffer type
+        size_t                                                      size = 0;           // original (GPU) buffer size in bytes
+        std::vector<std::pair<struct ggml_tensor *, size_t>>        tensors;           // (tensor, offset within buffer) snapshot
+    };
+    std::vector<kv_offload_staging> kv_offload_staging_;
+    bool                           kv_offloaded_ = false;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

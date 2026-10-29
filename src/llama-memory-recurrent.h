@@ -72,6 +72,10 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    // mmproj GPU-swap: offload/restore the recurrent-state buffers to/from host RAM
+    bool offload_to_cpu() override;
+    bool restore_to_gpu() override;
+
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
@@ -128,6 +132,15 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // mmproj GPU-swap: host-side staging for offloaded buffers (parallel to ctxs_bufs)
+    struct rmem_offload_staging {
+        ggml_backend_buffer_type_t                                  gpu_buft = nullptr; // original (GPU) buffer type
+        size_t                                                      size = 0;           // original (GPU) buffer size in bytes
+        std::vector<std::pair<struct ggml_tensor *, size_t>>        tensors;           // (tensor, offset within buffer) snapshot
+    };
+    std::vector<rmem_offload_staging> rmem_offload_staging_;
+    bool                              rmem_offloaded_ = false;
 
     bool resize(uint32_t new_mem_size);
     // true if no layers - can happen if the layer filter removes all layers

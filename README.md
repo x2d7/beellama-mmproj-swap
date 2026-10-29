@@ -1,5 +1,11 @@
 # Anbeeld's BeeLlama.cpp
 
+> **Changes from the base repository.** This fork adds the following on top of the base BeeLlama.cpp:
+>
+> - **`--mmproj-gpu-swap`** — the vision projector stays on CPU and is uploaded to VRAM only while images are being encoded; the KV cache temporarily moves to host RAM to make room. All images from the request are encoded during a single swap cycle — no repeated offload/restore mid-batch.
+> - **Swappable weight slice** (`--mmproj-gpu-swap-reserve-mb`) — a slice of the main-model weights lives in a dedicated buffer that is evicted from VRAM during image encoding and reloaded from disk afterwards, so even a model that barely fits can still serve images without an encoder OOM.
+> - **Image progress logs** — multi-image batches report `image encoding, n_images = 1/5 … 5/5` and `image decoding, …` in the server's `print_timing` style instead of silence.
+
 ![BeeLlama.cpp logo](beellama.jpg)
 
 BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing more speed and context out of local GGUF inference. It adds variance-normalized KV-cache quantization (KVarN), KV cache precision tail for recent tokens, low-bit cache types, adaptive draft control for speculative decoding, reasoning-loop protection, and more.

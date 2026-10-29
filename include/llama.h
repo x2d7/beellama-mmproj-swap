@@ -377,6 +377,13 @@ extern "C" {
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
+        // How many MiB of the model weights to keep in a dedicated "swappable"
+        // CUDA buffer (a separate buffer type, so it can be freed independently).
+        // During an mmproj GPU-swap cycle those weights are evicted from VRAM
+        // while the vision projector is on the GPU, then reloaded from disk.
+        // 0 disables the slice (all weights in the normal buffers).
+        int32_t mmproj_swap_reserve_mb;
+
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
@@ -678,6 +685,35 @@ extern "C" {
             "use llama_model_free instead");
 
     LLAMA_API void llama_model_free(struct llama_model * model);
+
+    // GPU swap support: access model tensors by name / index (used to offload weights to CPU)
+    LLAMA_API size_t llama_model_n_tensors(struct llama_model * model);
+    LLAMA_API const char * llama_model_get_tensor_name(struct llama_model * model, size_t i);
+    LLAMA_API struct ggml_tensor * llama_model_get_tensor(struct llama_model * model, const char * name);
+
+    // Re-evaluate backend assignment for all tensors after their buffers changed (GPU swap)
+    LLAMA_API void llama_context_sched_update(struct llama_context * ctx);
+
+    // Return the backend scheduler of a context (used by GPU swap manager)
+    LLAMA_API ggml_backend_sched_t llama_context_get_sched(struct llama_context * ctx);
+
+    // Return the CPU backend of a context (used by GPU swap manager to mark offloaded tensors)
+    LLAMA_API ggml_backend_t llama_context_get_cpu_backend(struct llama_context * ctx);
+
+    // mmproj GPU-swap: offload/restore the KV cache buffers to/from host RAM so
+    // the vision encoder fits on the device during image encoding.
+    LLAMA_API bool llama_kv_cache_offload_to_cpu(struct llama_context * ctx);
+    LLAMA_API bool llama_kv_cache_restore_to_gpu(struct llama_context * ctx);
+
+    // mmproj GPU-swap: evict/restore the swappable weight slice of the model.
+    // offload frees the dedicated slice buffer (tensors leave VRAM), restore
+    // reloads the tensors from the model file and re-uploads them. Callers must
+    // reset the scheduler (llama_context_sched_update) after either call.
+    LLAMA_API bool llama_model_swap_weights_offload(struct llama_model * model);
+    LLAMA_API bool llama_model_swap_weights_restore(struct llama_model * model);
+
+    // Size in bytes of the swappable weight slice (0 if the slice is disabled).
+    LLAMA_API size_t llama_model_swap_weights_size(struct llama_model * model);
 
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,

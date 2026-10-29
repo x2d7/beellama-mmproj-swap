@@ -622,6 +622,21 @@ const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
     throw std::runtime_error("Chunk not found");
 }
 
+bool server_tokens::is_inside_media(size_t idx) const {
+    if (map_idx_to_media.empty()) {
+        return false;
+    }
+    auto it = map_idx_to_media.upper_bound(idx);
+    if (it == map_idx_to_media.begin()) {
+        return false;
+    }
+    --it;
+    if (it->first == idx) {
+        return false; // exactly at the chunk start is a safe split point
+    }
+    return idx < it->first + mtmd_input_chunk_get_n_tokens(it->second.get());
+}
+
 std::pair<const mtmd::input_chunk_ptr *, size_t> server_tokens::find_next_media_chunk(size_t idx) const {
     auto it = map_idx_to_media.upper_bound(idx);
     if (it != map_idx_to_media.end()) {

@@ -22,12 +22,13 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
-#include "base64.hpp"
+#include "server-gpu-swap.h"
 
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
 #include <deque>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -333,6 +334,15 @@ struct server_slot {
     // multimodal
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
+    // image batches left to decode after the mmproj->KV swap-back (see update_slots)
+    std::vector<mtmd::batch_ptr> mtmd_pending_batches;
+    std::vector<size_t> mtmd_pending_chunks;    // chunk slot index per pending batch
+    std::vector<llama_pos> mtmd_pending_poses;  // KV position for each pending batch
+    // set once all remaining image chunks of the current task have been encoded
+    // in a single mmproj swap cycle (see update_slots)
+    bool mtmd_pre_encoded = false;
+    int32_t n_mtmd_total = 0;        // total image chunks of the current task, for progress
+    double t_mtmd_decode_ms = 0.0;   // cumulative image decode time, for progress
 
     struct tts_ctx {
         mtmd_helper::gen_audio ctx;
@@ -427,6 +437,13 @@ struct server_slot {
         prompt_cache_source = "none";
         prompt_cache_reason = "memory_cleared";
         spec_ckpt.clear();
+        // any pre-encoded media batches belong to the rolled-back prompt
+        mtmd_pending_batches.clear();
+        mtmd_pending_chunks.clear();
+        mtmd_pending_poses.clear();
+        mtmd_pre_encoded = false;
+        n_mtmd_total = 0;
+        t_mtmd_decode_ms = 0.0;
     }
 
     server_prompt_cache_state * prompt_save(server_prompt_cache & prompt_cache) const {
@@ -600,6 +617,12 @@ struct server_slot {
         audio_wait = false;
         audio_commit_rows.clear();
         inp_embd.clear();
+        mtmd_pending_batches.clear();
+        mtmd_pending_chunks.clear();
+        mtmd_pending_poses.clear();
+        mtmd_pre_encoded = false;
+        n_mtmd_total = 0;
+        t_mtmd_decode_ms = 0.0;
     }
 
     void init_sampler() const {
@@ -900,6 +923,16 @@ struct server_slot {
                 (int) stats.n_prompt_processed, f_progress, t_prompt_total / 1e3, n_prompt_second);
     }
 
+    void print_timing_mtmd_enc(int32_t n_done, int32_t n_total, double t_ms) const {
+        SLT_INF(*this, "image encoding, n_images = %d/%d, t = %6.2f s / %.2f images per second\n",
+                n_done, n_total, t_ms / 1e3, n_done / t_ms * 1e3);
+    }
+
+    void print_timing_mtmd_dec(int32_t n_done, int32_t n_total, double t_ms) const {
+        SLT_INF(*this, "image decoding, n_images = %d/%d, t = %6.2f s / %.2f images per second\n",
+                n_done, n_total, t_ms / 1e3, n_done / t_ms * 1e3);
+    }
+
     void print_timings() const {
         const double t_prompt_total = stats.t_prompt_ms();
         const double t_gen_total    = stats.t_gen_ms();
@@ -1019,6 +1052,105 @@ struct server_slot {
 
         other.prompt = prompt.clone();
         other.init_sampler();
+    }
+
+    // returns 0 on success
+    // caller need to update prompt.tokens after a successful call to keep track of the processing progress
+    // Encodes the media chunk at idx into a batch that is kept pending (not decoded yet).
+    // chunk_pos is the KV position where this chunk's image tokens will be written;
+    // it is derived from the task token stream (server_tokens::pos_next semantics) so
+    // chunks can be encoded out of order (all at once) and decoded later in prompt order.
+    // The actual KV decode (with the cache restored to GPU) happens later via process_mtmd_batches_decode().
+    int process_mtmd_chunk_encode(size_t idx, llama_pos chunk_pos) {
+        GGML_ASSERT(mctx);
+        const auto & input_tokens = task->tokens;
+        const auto & chunk = input_tokens.find_chunk(idx);
+        int32_t res = 0;
+
+        auto batch = mtmd::batch_ptr(mtmd_batch_init(mctx));
+        res = mtmd_batch_add_chunk(batch.get(), chunk.get());
+        GGML_ASSERT(res == 0); // we should never have an empty batch
+        res = mtmd_batch_encode(batch.get());
+        if (res != 0) {
+            SLT_ERR(*this, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
+            return -1;
+        }
+
+        mtmd_pending_batches.push_back(std::move(batch));
+        mtmd_pending_chunks.push_back(idx);
+        mtmd_pending_poses.push_back(chunk_pos);
+        return 0;
+    }
+
+    // Decodes the pre-encoded batch of a single media chunk, writing the image KV to
+    // the (GPU-restored) cache. Chunks are decoded in prompt order, so attention
+    // always sees the correct prefix. Returns 0 on success, -1 on error or if no
+    // pre-encoded batch exists for the chunk.
+    int process_mtmd_batches_decode(size_t chunk_idx, size_t & n_tokens_out) {
+        GGML_ASSERT(mctx);
+        int32_t res = 0;
+        n_tokens_out = 0;
+        const auto & input_tokens = task->tokens;
+
+        struct cb_data_t {
+            common_speculative * spec;
+            llama_context * ctx;
+        } cb_data = { spec, ctx_tgt };
+
+        static auto cb = [](const mtmd_helper_embd_batch * b, void * user_data) {
+            const auto * data = static_cast<cb_data_t *>(user_data);
+
+            common_batch batch(data->ctx);
+            for (int32_t i = 0; i < b->n_tokens; ++i) {
+                llama_pos pos[GGML_MROPE_SECTIONS] = { 0, 0, 0, 0 };
+                for (int32_t j = 0; j < b->n_pos; ++j) {
+                    pos[j] = b->pos[j * b->n_tokens + i];
+                }
+                batch.add_embd({ b->embd + (size_t) i * b->n_embd, 1, (size_t) b->n_embd }, pos, b->seq_id, false);
+            }
+
+            return common_speculative_process(data->spec, batch) ? 0 : 1;
+        };
+
+        for (size_t i = 0; i < mtmd_pending_batches.size(); ++i) {
+            if (mtmd_pending_chunks[i] != chunk_idx) {
+                continue;
+            }
+            const auto & batch = mtmd_pending_batches[i];
+            const auto & chunk = input_tokens.find_chunk(mtmd_pending_chunks[i]);
+            float * embd = mtmd_batch_get_output_embd(batch.get(), chunk.get());
+            if (embd) {
+                llama_pos new_n_past; // unused for now
+                res = mtmd_helper_decode_image_chunk(
+                    mctx,
+                    ctx_tgt,
+                    chunk.get(),
+                    embd,
+                    mtmd_pending_poses[i],
+                    id,
+                    llama_n_batch(ctx_tgt),
+                    &new_n_past,
+                    cb,
+                    &cb_data
+                );
+                if (res != 0) {
+                    SLT_ERR(*this, "failed to decode mtmd chunk idx = %zu, res = %d\n", mtmd_pending_chunks[i], res);
+                    mtmd_pending_batches.clear();
+                    mtmd_pending_chunks.clear();
+                    mtmd_pending_poses.clear();
+                    return -1;
+                }
+                n_tokens_out += mtmd_input_chunk_get_n_tokens(chunk.get());
+            }
+            // free the batch as soon as it is decoded to bound memory
+            mtmd_pending_batches.erase(mtmd_pending_batches.begin() + i);
+            mtmd_pending_chunks.erase(mtmd_pending_chunks.begin() + i);
+            mtmd_pending_poses.erase(mtmd_pending_poses.begin() + i);
+            return 0;
+        }
+
+        SLT_ERR(*this, "no pre-encoded batch for chunk idx = %zu\n", chunk_idx);
+        return -1;
     }
 };
 
@@ -1194,6 +1326,12 @@ public:
     }
 
     server_decision_context decision;
+    // mmproj GPU swap state (keep mmproj on CPU, load to GPU only for image encoding)
+    bool mmproj_gpu_swap = false;
+    bool mmproj_is_on_gpu = false;
+
+    // partial model-layer offload to free VRAM for mmproj during image encoding
+    gpu_swap_manager swap_mgr;
 
     server_queue    queue_tasks;
     server_response queue_results;
@@ -1325,6 +1463,8 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+
+        swap_mgr.reset();
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1377,6 +1517,33 @@ private:
         return true;
     }
 
+    mtmd_context_params make_mmproj_params(bool use_gpu) const {
+        mtmd_context_params mparams = mtmd_context_params_default();
+        mparams.use_gpu          = use_gpu;
+        mparams.print_timings    = false;
+        mparams.n_threads        = params_base.cpuparams.n_threads;
+        mparams.flash_attn_type  = params_base.flash_attn_type;
+        mparams.warmup           = use_gpu ? params_base.warmup : false; // only warmup when on GPU
+        mparams.image_min_tokens = params_base.image_min_tokens;
+        mparams.image_max_tokens = params_base.image_max_tokens;
+        mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
+        mparams.media_marker     = get_media_marker();
+        return mparams;
+    }
+
+    void reload_mmproj(bool use_gpu) {
+        gpu_swap_log_vram("mmproj_before_free", ctx_tgt);
+        mtmd_free(mctx);
+        mctx = nullptr;
+        gpu_swap_log_vram("mmproj_after_free", ctx_tgt);
+        auto mparams = make_mmproj_params(use_gpu);
+        mctx = mtmd_init_from_file(params_base.mmproj.path.c_str(), model_tgt, mparams);
+        gpu_swap_log_vram("mmproj_after_init", ctx_tgt);
+        for (server_slot & slot : slots) {
+            slot.mctx = mctx;
+        }
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
@@ -1427,12 +1594,14 @@ private:
         std::string & mmproj_path = params_base.mmproj.path;
         mtmd_context_params mparams = mtmd_context_params_default();
         if (has_mmproj) {
-            mparams.use_gpu          = params_base.mmproj_use_gpu;
+            // when GPU swap is enabled, keep mmproj on CPU initially; it is loaded to GPU only for encoding
+            const bool use_gpu = params_base.mmproj_gpu_swap ? false : params_base.mmproj_use_gpu;
+            mparams.use_gpu          = use_gpu;
             mparams.device           = params_base.mmproj_device;
             mparams.print_timings    = false;
             mparams.n_threads        = params_base.cpuparams.n_threads;
             mparams.flash_attn_type  = params_base.flash_attn_type;
-            mparams.warmup           = params_base.warmup;
+            mparams.warmup           = use_gpu ? params_base.warmup : false; // only warmup when on GPU
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
@@ -1445,7 +1614,8 @@ private:
         // get the memory usage of mmproj, also used to check image_max_tokens against n_ubatch
         mtmd_memory_usage mmproj_usage = {{}, -1, false};
         int64_t mmproj_usage_t_us = 0;
-        if (has_mmproj) {
+        // with --mmproj-gpu-swap the projector is loaded on demand, so skip the fit measurement
+        if (has_mmproj && !params_base.mmproj_gpu_swap) {
             int64_t t_start = ggml_time_us();
             mmproj_usage = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
             mmproj_usage_t_us = ggml_time_us() - t_start;
@@ -1453,7 +1623,8 @@ private:
 
         // optionally fit mmproj memory usage
         // on resume params_base already holds the margin from the first load
-        if (has_mmproj && params_base.fit_params && !is_resume) {
+        // with --mmproj-gpu-swap the projector is not resident and must not be fitted
+        if (has_mmproj && params_base.fit_params && !is_resume && !params_base.mmproj_gpu_swap) {
             const auto & mmproj_mem = mmproj_usage.backend_mem_usage;
             const int64_t t_elapsed = mmproj_usage_t_us;
             if (!mmproj_mem.empty()) {
@@ -1581,6 +1752,14 @@ private:
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
 
+            mmproj_gpu_swap = params_base.mmproj_gpu_swap && !model_dft;
+            if (mmproj_gpu_swap) {
+                SRV_INF("%s", "[mtmd] GPU swap enabled: KV cache buffers freed during image encoding, mmproj loaded to GPU only on demand\n");
+                swap_mgr.enabled = true;
+                // Free enough VRAM to fit the mmproj weights (~1.1 GiB) plus the
+                // inference compute buffer (~0.25 GiB) and a safety margin.
+                swap_mgr.target_free_bytes = (size_t)2800 * 1024 * 1024;
+            }
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
             init_opt.video_params.ffmpeg_bin_dir = params_base.video_ffmpeg_bin_dir.empty()
@@ -3040,9 +3219,20 @@ private:
                 (slot.draft_owns_state && draft_p1 >= 0)) {
             return 0;
         }
-        const llama_pos common_p0 = slot.draft_owns_state ? std::min(target_p0, draft_p0) : target_p0;
-        return common_p0 > 0 && common_p0 <= requested_p0 ?
-                slot.prompt.tokens.size_up_to_pos(common_p0) : 0;
+        llama_pos common_p0 = slot.draft_owns_state ? std::min(target_p0, draft_p0) : target_p0;
+        if (common_p0 <= 0 || common_p0 > requested_p0) {
+            return 0;
+        }
+        // A KVarN descriptor boundary can land inside a media chunk (e.g. the last
+        // message is an image). A media chunk cannot be split, so step back by whole
+        // reuse groups until the boundary is outside every chunk; the tail is then
+        // re-encoded, but the bulk of the context is still reused.
+        const int32_t alignment = std::max<int32_t>(1, prompt_reuse_alignment());
+        while (common_p0 > 0 &&
+                slot.prompt.tokens.is_inside_media(slot.prompt.tokens.size_up_to_pos(common_p0))) {
+            common_p0 -= alignment;
+        }
+        return common_p0 > 0 ? slot.prompt.tokens.size_up_to_pos(common_p0) : 0;
     }
 
     // launch multiple slots for parent + child tasks
@@ -5011,7 +5201,99 @@ private:
 
                     bool has_mtmd = false;
 
-                    // check if we should process the mtmd chunk
+                    // Encode all remaining image chunks of the task in a single mmproj swap
+                    // cycle, done once per task at the first image chunk. The encode pass has
+                    // no KV dependency (it only runs the CLIP front end), so the KV cache can
+                    // stay offloaded while every batch is prepared; the batches are decoded
+                    // later, in prompt order, once the KV cache is back on the GPU. This turns
+                    // N images (even with interleaved text) into exactly one swap cycle per
+                    // task instead of one per image.
+                    if (!slot.mtmd_pre_encoded &&
+                        slot.prompt.n_tokens() < slot.task->n_tokens() &&
+                        input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
+
+                        // total number of image chunks left in the task, for progress reporting
+                        slot.n_mtmd_total = 0;
+                        for (size_t j = slot.prompt.n_tokens(); j < (size_t) slot.task->n_tokens();) {
+                            if (input_tokens[j] == LLAMA_TOKEN_NULL) {
+                                slot.n_mtmd_total++;
+                                j += mtmd_input_chunk_get_n_tokens(input_tokens.find_chunk(j).get());
+                            } else {
+                                j++;
+                            }
+                        }
+
+                        // swap mmproj to GPU for image encoding (kept on CPU otherwise)
+                        // (t_enc0 covers the swap too, so the progress reflects the real wait)
+                        const int64_t t_enc0 = ggml_time_us();
+                        if (mmproj_gpu_swap && !mmproj_is_on_gpu) {
+                            SRV_INF("%s", "[mtmd] freeing KV cache buffers to free VRAM for mmproj\n");
+                            swap_mgr.swap_to_mmproj_gpu(mctx, model_tgt, ctx_tgt);
+                            SRV_INF("%s", "[mtmd] swapping mmproj to GPU for image encoding\n");
+                            reload_mmproj(true);
+                            if (!mctx) {
+                                SRV_ERR("%s", "[mtmd] failed to load mmproj to GPU, falling back to CPU\n");
+                                reload_mmproj(false);
+                                swap_mgr.swap_to_model_gpu(mctx, model_tgt, ctx_tgt);
+                            } else {
+                                mmproj_is_on_gpu = true;
+                            }
+                        }
+
+                        // encode every remaining image chunk; the KV position for each chunk
+                        // is derived from the task token stream, matching server_tokens::pos_next
+                        // semantics for the point where the chunk's image KV will be written
+                        bool encode_ok = true;
+                        int32_t n_encoded = 0;
+                        size_t idx = slot.prompt.n_tokens();
+                        while (idx < (size_t) slot.task->n_tokens()) {
+                            if (input_tokens[idx] == LLAMA_TOKEN_NULL) {
+                                const auto & chunk = input_tokens.find_chunk(idx);
+                                const llama_pos chunk_pos = input_tokens.pos_next(idx);
+                                int32_t res = slot.process_mtmd_chunk_encode(idx, chunk_pos);
+                                if (res != 0) {
+                                    SLT_ERR(slot, "failed to process image, res = %d\n", res);
+                                    encode_ok = false;
+                                    break;
+                                }
+                                n_encoded++;
+                                slot.print_timing_mtmd_enc(n_encoded, slot.n_mtmd_total, (ggml_time_us() - t_enc0) / 1e3);
+                                idx += mtmd_input_chunk_get_n_tokens(chunk.get());
+                            } else {
+                                idx++;
+                            }
+                        }
+
+                        // restore the KV cache to GPU (and mmproj to CPU) before decoding
+                        // anything; unconditional, even on encode errors
+                        if (mmproj_gpu_swap && mmproj_is_on_gpu) {
+                            SRV_INF("%s", "[mtmd] swapping mmproj back to CPU\n");
+                            reload_mmproj(false);
+                            if (!mctx) {
+                                SRV_ERR("%s", "[mtmd] failed to move mmproj back to CPU\n");
+                            } else {
+                                mmproj_is_on_gpu = false;
+                            }
+                            SRV_INF("%s", "[mtmd] restoring KV cache buffers to GPU\n");
+                            swap_mgr.swap_to_model_gpu(mctx, model_tgt, ctx_tgt);
+                        }
+
+                        if (!encode_ok) {
+                            slot.mtmd_pending_batches.clear();
+                            slot.mtmd_pending_chunks.clear();
+                            slot.mtmd_pending_poses.clear();
+                            slot.mtmd_pre_encoded = false;
+                            send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
+                            slot.release();
+                            return;
+                        }
+
+                        slot.mtmd_pre_encoded = true;
+                    }
+
+                    // consume the run of consecutive image tokens, decoding each chunk's
+                    // pre-encoded batch in prompt order (the KV cache is on the GPU again,
+                    // so image attention always sees the correct prefix)
                     while (true) {
                         auto cur_token_idx = slot.prompt.n_tokens();
                         if (
@@ -5021,35 +5303,37 @@ private:
                             break;
                         }
 
-                        // process the mtmd chunk
-                        // note: it submits its own decode, potentially be async
-                        //       so the timing is queued and flushed on the next sync
-                        metrics_pre_decode();
-
-                        // encode on the worker thread, so we can still handle metrics tasks
-                        size_t n_tokens_out = 0;
-                        int32_t res = 0;
-                        queue_tasks.yield_to_queue([&]() {
-                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
-                        });
-
-                        if (res != 0) {
-                            SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
-                            send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
-                            slot.release();
-                            return; // the slot is done, skip it entirely
-                        }
-
-                        metrics_queue_prompt(n_tokens_out);
-                        slot.stats.n_prompt_processed += n_tokens_out;
-                        slot.stats.update_prompt_last();
-
-                        // add the mtmd chunk to cache
+                        // add the image chunk to cache
                         {
                             const auto & chunk = input_tokens.find_chunk(cur_token_idx);
                             // the chunk is already in the KV cache at this point, so we don't need to keep its data around
                             slot.prompt.tokens.push_back_placeholder(chunk.get());
                         }
+
+                        // note: the decode is submitted here, so the timing is queued
+                        //       and flushed on the next sync
+                        metrics_pre_decode();
+
+                        // decode the batch for this chunk now that the KV cache is back on the GPU.
+                        // KVarN attention has no CPU path, so decoding with the cache offloaded would
+                        // force the scheduler to copy the whole KV cache into the CUDA compute buffer
+                        // (O(H on large ctx)).
+                        size_t n_image_tokens = 0;
+                        const int64_t t_dec0 = ggml_time_us();
+                        int32_t res_decode = slot.process_mtmd_batches_decode(cur_token_idx, n_image_tokens);
+                        slot.t_mtmd_decode_ms += (ggml_time_us() - t_dec0) / 1e3;
+                        if (res_decode != 0) {
+                            SLT_ERR(slot, "failed to decode image, res = %d\n", res_decode);
+                            send_error(slot, "failed to decode image", ERROR_TYPE_SERVER);
+                            slot.release();
+                            return;
+                        }
+                        slot.print_timing_mtmd_dec(
+                                slot.n_mtmd_total - (int32_t) slot.mtmd_pending_chunks.size(),
+                                slot.n_mtmd_total, slot.t_mtmd_decode_ms);
+                        metrics_queue_prompt(n_image_tokens);
+                        slot.stats.n_prompt_processed += n_image_tokens;
+                        slot.stats.update_prompt_last();
 
                         has_mtmd = true;
                     }

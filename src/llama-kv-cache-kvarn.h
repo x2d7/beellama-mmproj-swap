@@ -286,6 +286,10 @@ public:
             llama_kv_cache::slot_info_vec_t * sinfos_out,
             const llama_kv_cache::slot_info_vec_t * sinfos_in);
 
+    // mmproj GPU-swap: offload/restore the KVarN cache buffers to/from host RAM
+    bool offload_to_cpu() override;
+    bool restore_to_gpu() override;
+
     llama_kv_cache * get_metadata_cache() const;
     ggml_tensor * get_materialization_source(int32_t il, bool value) const;
     std::unique_ptr<llama_kv_cache> make_shared_metadata_cache(const llama_model & model_view) const;
@@ -407,4 +411,13 @@ private:
     std::unordered_map<int32_t, int32_t> map_layer_ids;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
     llama_kv_cache::stream_copy_info pending_stream_copies;
+
+    // mmproj GPU-swap: host-side staging for offloaded buffers (parallel to ctxs_bufs)
+    struct kvarn_offload_staging {
+        ggml_backend_buffer_type_t                                  gpu_buft = nullptr; // original (GPU) buffer type
+        size_t                                                      size = 0;           // original (GPU) buffer size in bytes
+        std::vector<std::pair<struct ggml_tensor *, size_t>>        tensors;           // (tensor, offset within buffer) snapshot
+    };
+    std::vector<kvarn_offload_staging> kvarn_offload_staging_;
+    bool kvarn_offloaded_ = false;
 };

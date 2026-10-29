@@ -690,6 +690,8 @@ struct common_params {
     // multimodal models (see tools/mtmd)
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;                 // use GPU for multimodal model
+    bool mmproj_gpu_swap = false;               // swap mmproj VRAM on vision requests (keep mmproj on CPU, load to GPU only for encode)
+    int32_t mmproj_swap_reserve_mb = 0;         // MiB of main-model weights to keep in a dedicated swappable CUDA buffer (with mmproj_gpu_swap)
     ggml_backend_dev_t mmproj_device = nullptr; // GPU device to use for multimodal model
     bool no_mmproj = false;                     // explicitly disable multimodal model
     std::vector<std::string> image;             // path to image file(s) ; TODO: change the name to "media"
@@ -727,6 +729,7 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    int32_t rs_rollback         = 0;     // recurrent-state snapshots per sequence, enables prompt-cache rollback on hybrid models
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 

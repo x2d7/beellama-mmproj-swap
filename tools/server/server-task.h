@@ -828,6 +828,7 @@ static inline server_prompt_reuse_plan server_prompt_plan_reuse(
         if (checkpoint.n_tokens > 0 &&
                 checkpoint.n_tokens <= int64_t(result.lexical_tokens) &&
                 checkpoint.n_tokens%alignment == 0 &&
+                !prompt.tokens.is_inside_media(size_t(checkpoint.n_tokens)) &&
                 checkpoint.pos_max <= requested_p0 &&
                 size_t(checkpoint.n_tokens) > result.restorable_tokens) {
             result.restorable_tokens = size_t(checkpoint.n_tokens);

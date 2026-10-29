@@ -134,6 +134,9 @@ public:
     llama_memory_i * get_base() const;
     llama_memory_i * get_swa () const;
 
+    // mmproj GPU-swap: offload/restore the composed KV caches to/from host RAM
+    bool offload_to_cpu() override;
+    bool restore_to_gpu() override;
     // Owned DFlash image rows can outnumber their logical SWA positions.
     // Replacement is published only after the caller has transferred state.
     bool grow_swa(const std::function<void(llama_memory_i &, llama_memory_i &)> & transfer);
