@@ -3489,9 +3489,7 @@ private:
         if (slot.task && slot.task->tokens.has_mtmd) {
             return; // image chunks must stay inside one ubatch
         }
-        SLT_DBG(slot, "dyn-sync: kv=%d new=%d cur=%u free=%lld\n",
-                (int) slot.prompt.n_tokens(), (int) new_prompt,
-                llama_n_ubatch(ctx_tgt), (long long) dyn_free_mb());
+
 
         uint32_t cur = llama_n_ubatch(ctx_tgt);
         const int32_t n_kv = slot.prompt.n_tokens();
@@ -3536,8 +3534,9 @@ private:
         }
 
         if (new_prompt) {
-            SLT_DBG(slot, "dyn-batch: new prompt plan ub=%u cur=%u free=%lld MiB reserved=%d c=%.3f\n",
-                    t, cur, (long long) free_mb, (int) c_reserved, dyn_compute_mb_per_ub());
+            SRV_INF("dyn-plan: id=%d kv=%d new=%d ub=%u cur=%u free=%lld reserved=%d c=%.3f\n",
+                    slot.id, (int) slot.prompt.n_tokens(), (int) new_prompt, t, cur,
+                    (long long) free_mb, (int) c_reserved, dyn_compute_mb_per_ub());
             if (t != cur) {
                 llama_set_n_ubatch(ctx_tgt, t);
                 cur = llama_n_ubatch(ctx_tgt);
