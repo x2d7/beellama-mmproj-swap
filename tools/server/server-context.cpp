@@ -3524,23 +3524,22 @@ private:
         uint32_t t = dyn_batch.auto_curve
                 ? fit
                 : dyn_batch.plan((uint64_t) slot.prompt.n_tokens(), free_mb);
-        // occupancy only grows inside a prompt: the ubatch may step down, never
-        // up -- except in the first ~2k tokens, right after a resize, when the
-        // measured free VRAM is still settling (the VMM pool holds the old
-        // blocks for a moment)
+        // a prompt with nothing evaluated yet (including right after a resize) is
+        // a fresh start: the plan may raise the cap, not only lower it
+        const bool fresh = new_prompt || slot.prompt.n_tokens() == 0;
         const bool settle_ok = slot.prompt.n_tokens() < 2048;
-        if (!new_prompt && !settle_ok) {
+        if (!fresh && !settle_ok) {
             t = std::min(t, cur);
         }
 
-        if (new_prompt) {
-            SRV_INF("dyn-plan: id=%d kv=%d new=%d ub=%u cur=%u free=%lld reserved=%d c=%.3f\n",
-                    slot.id, (int) slot.prompt.n_tokens(), (int) new_prompt, t, cur,
+        if (fresh) {
+            SRV_INF("dyn-plan: id=%d kv=%d fresh=%d ub=%u cur=%u free=%lld reserved=%d c=%.3f\n",
+                    slot.id, (int) slot.prompt.n_tokens(), (int) fresh, t, cur,
                     (long long) free_mb, (int) c_reserved, dyn_compute_mb_per_ub());
             if (t != cur) {
                 llama_set_n_ubatch(ctx_tgt, t);
                 cur = llama_n_ubatch(ctx_tgt);
-                SLT_INF(slot, "dyn-batch: new prompt, ubatch -> %u (free=%lld MiB)\n", cur, (long long) free_mb);
+                SLT_INF(slot, "dyn-batch: fresh prompt, ubatch -> %u (free=%lld MiB)\n", cur, (long long) free_mb);
             }
         } else if (dyn_batch.should_apply(cur, t)) {
             uint32_t next = t;
