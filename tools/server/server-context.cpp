@@ -2419,7 +2419,7 @@ private:
             const int64_t gen  = std::min<int64_t>(slot.n_predict_max > 0 ? slot.n_predict_max : 512, 8192);
             int64_t       need = std::min<int64_t>(n_ctx_max, (int64_t) slot.task->n_tokens() + gen + 2048);
             need = (need / 256) * 256;
-            if (need > 0 && std::llabs(need - cur0) >= 2048) {
+            if (need > 0 && need < cur0 && std::llabs(need - cur0) >= 2048) {
                 SRV_DBG("ctx-resize check: cur=%d need=%d kv_empty=%d task=%d gen=%d\n",
                         (int) cur0, (int) need, (int) kv_empty,
                         (int) slot.task->n_tokens(), (int) gen);
@@ -2479,20 +2479,31 @@ private:
         if (need <= 0 || std::llabs(need - cur) < 2048) {
             return;
         }
+        if (need > cur) {
+            // growth from outside the decode loop leaves only ~245 MiB free at
+            // depth, which starves the ubatch; let the in-prompt growth handle it
+            // (measured 527 t/s vs 224 t/s)
+            return;
+        }
+        const int64_t free_before = dyn_free_mb();
         const int64_t t0 = ggml_time_us();
         llama_resize_ctx(ctx_tgt, (uint32_t) need, true);
+        const int64_t free_after = dyn_free_mb();
         const uint32_t got = llama_n_ctx(ctx_tgt);
         if (got == (uint32_t) cur) {
             return;
         }
+        SRV_INF("ctx-resize mem: free %lld -> %lld MiB (cur %d -> %u cells)\n",
+                (long long) free_before, (long long) free_after, (int) cur, got);
         n_ctx = got;
         for (auto & s : slots) {
             s.n_ctx = n_ctx_slot();
         }
         batch.view.set_mem(llama_get_memory(ctx_tgt));
-        // the pool still holds the previous allocation for a moment: start the
-        // first chunk with the smallest ubatch and let the planner raise it once
-        // the free VRAM has settled
+        // start the first chunk with the smallest ubatch: raising it right after
+        // a resize hits a stale KVarN tail mapping (assert in
+        // set_input_kq_mask_tail_mapped), the planner raises it once the memory
+        // has settled
         if (dyn_batch.enabled()) {
             llama_set_n_ubatch(ctx_tgt, dyn_batch.ub_min);
         }
@@ -3522,6 +3533,8 @@ private:
         }
 
         if (new_prompt) {
+            SLT_DBG(slot, "dyn-batch: new prompt plan ub=%u cur=%u free=%lld MiB reserved=%d c=%.3f\n",
+                    t, cur, (long long) free_mb, (int) c_reserved, dyn_compute_mb_per_ub());
             if (t != cur) {
                 llama_set_n_ubatch(ctx_tgt, t);
                 cur = llama_n_ubatch(ctx_tgt);
@@ -5237,7 +5250,7 @@ private:
                                 const int64_t gen = std::min<int64_t>(slot.n_predict_max > 0 ? slot.n_predict_max : 512, 8192);
                                 int64_t need = std::min<int64_t>(n_ctx_max, (int64_t) slot.task->n_tokens() + gen + 2048);
                                 need = (need / 256) * 256;
-                                if (need > 0 && std::llabs(need - cur) >= 2048) {
+                                if (need > 0 && need < cur && std::llabs(need - cur) >= 2048) {
                                     slot.mem.seq_rm(slot.id, 0, -1);
                                     llama_resize_ctx(ctx_tgt, (uint32_t) need, true);
                                     const uint32_t got = llama_n_ctx(ctx_tgt);

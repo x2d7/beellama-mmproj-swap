@@ -284,6 +284,27 @@ N-gram-only modes do not create a draft context.
 | Chat request JSON `"reasoning_control": true` | — | `false` | Arms a live `/v1/chat/completions` request for external reasoning control. The chat template must expose a reasoning end sequence. |
 | `POST /v1/chat/completions/control` with `{"id":"chatcmpl-...","action":"reasoning_end"}` | — | Disabled per request | Forces the armed completion's reasoning sampler toward its final-answer phase. Unknown or completed ids return a non-success result; `reasoning_end` is the only accepted action. |
 
+## Dynamic batching and KV capacity
+
+Prefill batching is chosen per prompt from the current KV occupancy and free
+VRAM. The ubatch cap only moves between `llama_decode()` calls, never inside one.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--dyn-batch-curve SPEC` | - | `off` | `auto` sizes the ubatch from free VRAM; `kv:ub,kv:ub,...` sets an explicit plan interpolated by depth (e.g. `0:768,65536:700,81920:560,90112:448,98304:384`). With an explicit curve the plan is used as-is for speed, and the free-VRAM fit only applies in `auto` mode. |
+| `--dyn-batch-ub-min N` | - | `48` | Lower bound for the dynamic cap. |
+| `--dyn-batch-ub-max N` | - | `0` | Upper bound; `0` = the ubatch from `-ub`. |
+| `--dyn-batch-guard-mb N` | - | `300` | Free VRAM kept after the compute buffer. The measured OOM boundary on the 16 GB test card is ~400 MiB (successful deep runs left 425-626 MiB, failures 358-364 MiB). |
+| `--dyn-batch-step N` | - | `16` | Deadband: the cap changes only when the target moves by at least this much. |
+| `--dyn-batch-max-drop N` | - | `0` | Maximum change per step; `0` = jump straight to the target. |
+| `--ctx-grow N` | `LLAMA_ARG_CTX_GROW` | `0` | Start with `N` KV cells and grow towards `--ctx-size` when a prompt no longer fits. Growth captures the sequence state, rebuilds the cache and restores it (a few seconds at 100k cells). |
+| `LLAMA_CTX_RESIZE=1` | `LLAMA_CTX_RESIZE` | off | Experimental: additionally shrink the capacity at prompt start when the request cannot reuse the cached prefix (94k -> 10.7k in 30-40 ms). Known issues: after a shrink the ubatch planner keeps the small cap in this path, and raising the cap immediately after a resize hits a stale KVarN tail mapping. |
+
+Depth curves trade VRAM between the KV cache and the ubatch: a large ubatch is
+fast at shallow depth, a large capacity is what makes long prompts possible. A
+request that fits in fewer cells keeps its ubatch large; a 90k prompt gives the
+VRAM to the cache and drops the ubatch.
+
 ## Presets
 
 | Argument | Env var | Default | Behavior |

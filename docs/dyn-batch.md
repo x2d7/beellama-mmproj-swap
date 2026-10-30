@@ -59,52 +59,37 @@ Two modes for `--dyn-batch-curve`:
 
 ## Context growth and shrink
 
-`--ctx-grow N` starts the context with `N` cells and, with
-`LLAMA_CTX_RESIZE=1`, lets the server resize it per request. When the incoming
-prompt cannot reuse a cached prefix (common prefix < 1024 tokens), the sequence
-memory is wiped at task launch and the capacity is resized to
-`prompt + generation budget + 2k`, capped by `--ctx-size`:
-
-* growing from an empty cache is free (no state copy) - a 4k -> 20k resize
-  takes ~0.8 s, a 10k -> 95k resize ~1.6 s;
-* shrinking is a plain reallocation - 92k -> 10k takes ~20 ms - and gives the
-  VRAM back to the ubatch, restoring the small-prompt prefill rate;
-* if the prefix is reused (multi-turn, restored checkpoint) the capacity is
-  left alone, so a long conversation keeps its cache.
-
-Growth (when the prefix must be preserved, e.g. a prompt that extends the
-cached one):
+`--ctx-grow N` starts the context with `N` cells instead of `--ctx-size` and
+lets the server grow it when a prompt no longer fits:
 
 1. captures the live sequence state (attention + recurrent) into host memory;
 2. frees the old cache, allocates the larger one;
 3. restores the state and re-reserves the scheduler;
 4. re-sizes the ubatch from the new free VRAM, or from the curve when one is set.
 
-The target is the prompt length plus ~3% (never `--ctx-size` straight away): a
-cache sized for the prompt keeps the ubatch large, while a jump to the maximum
-starves it. Growth is monotonic for the life of the server, so later turns and
-cached prefixes do not pay for it again.
+Growth is monotonic for the life of the server and preserves the cached
+sequences, so later turns do not pay for it again. The target is the prompt
+length plus ~3% (never `--ctx-size` straight away): a cache sized for the prompt
+keeps the ubatch large, while a jump to the maximum starves it.
 
 `POST /slots/<id>?action=restore` grows the context first when the saved slot
 holds more tokens than the current capacity, instead of failing with
 "no available space in KV cache".
 
-Measured (IQ4_XS, kvarn6, 16 GB, start 88k, depth curve):
+**Shrinking** is implemented (`llama_resize_ctx(..., allow_shrink)`) and runs at
+prompt start when the request cannot reuse a cached prefix (common prefix <
+1024 tokens): the sequence memory is wiped and the capacity is rebuilt without a
+state copy. Measured 95488 -> 10752 cells in 29-45 ms with free VRAM recovering
+from 39 to 2337 MiB. It is behind `LLAMA_CTX_RESIZE=1` because two problems
+remain:
 
-| request | capacity | prefill |
-|---|---:|---:|
-| 8k prompt | 10.7k (shrunk at prompt start, 40 ms) | 797-826 t/s |
-| 90k prompt | 95.5k (grown in-prompt, 1.6 s) | 527 t/s |
-| 8k prompt right after the 90k one | 95.5k | 743 t/s |
-| checkpoint save / restore | 8.8k tokens | 2.1 s / 1.3 s |
+* after a shrink, the ubatch planner keeps the small cap in that path (the 8k
+  prompt right after a 90k one ran at ~422 t/s instead of ~800);
+* raising the cap immediately after a resize hits an assert in
+  `llama_kv_cache::set_input_kq_mask_tail_mapped` (stale KVarN tail mapping).
 
-The experimental per-request resize is behind `LLAMA_CTX_RESIZE=1` because of a
-CUDA VMM limitation: the pool is a bump allocator whose `free()` only moves the
-pointer, so a large grow/shrink leaves the physical pages mapped and the later
-ubatch planning sees less free VRAM than exists (measured: 224 t/s instead of
-527 t/s for a 90k prompt after a 10.7k -> 94.4k resize). The pool now releases
-unused tails larger than 512 MiB, which fixes the accounting for the in-prompt
-growth but not yet for the out-of-loop resize.
+Without the per-request shrink the default configuration is stable: the KV
+capacity is sized once from `--ctx-grow` and grows on demand.
 
 ## Tuning process
 
