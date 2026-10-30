@@ -59,6 +59,7 @@ void gpu_swap_manager::reset() {
     std::lock_guard<std::mutex> lock(mtx);
     state = gpu_swap_state::MODEL_ON_GPU;
     enabled = false;
+    weights_evicted = false;
     swap_stats = {};
 }
 
@@ -98,27 +99,44 @@ bool gpu_swap_manager::swap_to_mmproj_gpu(struct mtmd_context * /*mctx*/,
 
     const int64_t t_start = ggml_time_us();
 
+    const int64_t t_kv0 = ggml_time_us();
     bool ok = llama_kv_cache_offload_to_cpu(lctx);
+    fprintf(stderr, "gpu_swap: KV offload took %.0f ms\n", (double) (ggml_time_us() - t_kv0) / 1000.0);
     if (!ok) {
         fprintf(stderr, "%s: failed to offload KV cache to CPU, entering ERROR state\n", __func__);
         state = gpu_swap_state::ERROR;
         return false;
     }
 
-    // evict the swappable weight slice (if configured) to free additional VRAM
+    // Evict the swappable weight slice only when freeing the KV cache alone is
+    // not enough. The slice is reloaded from the model file on every restore,
+    // which costs 10-20 s on a large context; keeping it resident is free.
+    weights_evicted = false;
     if (model) {
         const size_t swap_size = llama_model_swap_weights_size(model);
         if (swap_size > 0) {
-            const int64_t t_swap = ggml_time_us();
-            if (!llama_model_swap_weights_offload(model)) {
-                fprintf(stderr, "%s: failed to offload swappable weights to CPU, entering ERROR state\n", __func__);
-                state = gpu_swap_state::ERROR;
-                return false;
+            size_t free_vram = 0;
+            size_t total_vram = 0;
+            ggml_backend_cuda_get_device_memory(0, &free_vram, &total_vram);
+            if (free_vram >= target_free_bytes) {
+                fprintf(stderr,
+                        "gpu_swap: %.0f MiB free after KV offload >= %.0f MiB target, keeping %.2f MiB of weights on GPU\n",
+                        (double) free_vram / 1024.0 / 1024.0,
+                        (double) target_free_bytes / 1024.0 / 1024.0,
+                        (double) swap_size / 1024.0 / 1024.0);
+            } else {
+                const int64_t t_swap = ggml_time_us();
+                if (!llama_model_swap_weights_offload(model)) {
+                    fprintf(stderr, "%s: failed to offload swappable weights to CPU, entering ERROR state\n", __func__);
+                    state = gpu_swap_state::ERROR;
+                    return false;
+                }
+                weights_evicted = true;
+                swap_stats.n_swap_mmproj_to_gpu++;
+                swap_stats.t_swap_mmproj_to_gpu_us += (ggml_time_us() - t_swap);
+                fprintf(stderr, "gpu_swap: evicted %.2f MiB of swappable weights (%.0f ms)\n",
+                        (double) swap_size / 1024.0 / 1024.0, (double) (ggml_time_us() - t_swap) / 1000.0);
             }
-            swap_stats.n_swap_mmproj_to_gpu++;
-            swap_stats.t_swap_mmproj_to_gpu_us += (ggml_time_us() - t_swap);
-            fprintf(stderr, "gpu_swap: evicted %.2f MiB of swappable weights (%.0f ms)\n",
-                    (double) swap_size / 1024.0 / 1024.0, (double) (ggml_time_us() - t_swap) / 1000.0);
         }
     }
 
@@ -168,7 +186,9 @@ bool gpu_swap_manager::swap_to_model_gpu(struct mtmd_context * /*mctx*/,
 
     const int64_t t_start = ggml_time_us();
 
+    const int64_t t_kv0 = ggml_time_us();
     bool ok = llama_kv_cache_restore_to_gpu(lctx);
+    fprintf(stderr, "gpu_swap: KV restore took %.0f ms\n", (double) (ggml_time_us() - t_kv0) / 1000.0);
     if (!ok) {
         fprintf(stderr, "%s: failed to restore KV cache to GPU, entering ERROR state\n", __func__);
         state = gpu_swap_state::ERROR;
@@ -176,7 +196,7 @@ bool gpu_swap_manager::swap_to_model_gpu(struct mtmd_context * /*mctx*/,
     }
 
     // reload the swappable weight slice before any decode touches the model
-    if (model) {
+    if (model && weights_evicted) {
         const size_t swap_size = llama_model_swap_weights_size(model);
         if (swap_size > 0) {
             const int64_t t_swap = ggml_time_us();
@@ -191,6 +211,7 @@ bool gpu_swap_manager::swap_to_model_gpu(struct mtmd_context * /*mctx*/,
                     (double) swap_size / 1024.0 / 1024.0, (double) (ggml_time_us() - t_swap) / 1000.0);
         }
     }
+    weights_evicted = false;
 
     if (lctx) {
         // Force the scheduler to re-reserve with the expected buffer sizes.

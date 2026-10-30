@@ -73,6 +73,19 @@ struct llama_context {
     uint32_t n_ubatch()  const;
     uint32_t n_seq_max() const;
 
+    // shrink the physical batch cap for the next decode; bounded by the value
+    // captured at context creation and by cparams.n_batch
+    void set_n_ubatch(uint32_t n_ubatch);
+
+    // grow the context (KV capacity) in place, preserving sequence state.
+    // Grow-only; the new size is aligned and the memory modules are rebuilt.
+    bool grow_ctx(uint32_t new_n_ctx);
+
+    // cache parameters captured at construction, needed to rebuild the memory
+    ggml_type mem_type_k = GGML_TYPE_F16;
+    ggml_type mem_type_v = GGML_TYPE_F16;
+    bool      mem_swa_full = false;
+
     uint32_t n_threads()       const;
     uint32_t n_threads_batch() const;
 
@@ -376,6 +389,11 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // physical batch size captured at construction: the memory modules (SWA
+    // length, KV-tail stride, KVarN SWA ring, DSV4 window) are sized from it,
+    // so runtime changes must never exceed this value
+    uint32_t n_ubatch_max = 0;
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

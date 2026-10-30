@@ -26,6 +26,12 @@ llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_spars
     seq_idx.resize(LLAMA_MAX_SEQ, -1);
 }
 
+void llama_batch_ext_set_mem(llama_batch_ext * batch, llama_memory_t mem) {
+    if (batch != nullptr) {
+        batch->mem = mem;
+    }
+}
+
 bool llama_batch_allocr::init(
         const llama_batch_ext & batch_inp,
         const llama_vocab & vocab,

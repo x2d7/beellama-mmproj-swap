@@ -745,6 +745,18 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
+
+    // Change the physical batch cap for the next decode. Bounded by the value
+    // captured at context creation (memory modules are sized from it), by
+    // n_batch and by n_rs_seq + 1. The scheduler is re-reserved before the next
+    // decode, so call it between decodes, not while one is running.
+    LLAMA_API void     llama_set_n_ubatch(struct llama_context * ctx, uint32_t n_ubatch);
+
+    // Grow the KV cache capacity of a context in place, preserving the state of
+    // every sequence. Grow-only; the value is rounded up to the internal
+    // alignment. Returns silently on failure (the context keeps its size).
+    // Growth rebuilds the memory modules and requires an empty decode queue.
+    LLAMA_API void     llama_set_n_ctx(struct llama_context * ctx, uint32_t n_ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 
@@ -1284,6 +1296,8 @@ extern "C" {
     };
 
     LLAMA_API struct llama_batch_ext * llama_batch_ext_init (struct llama_context * ctx);
+    // refresh the memory module pointer captured by the batch (after llama_set_n_ctx)
+    LLAMA_API void llama_batch_ext_set_mem(struct llama_batch_ext * batch, llama_memory_t mem);
     LLAMA_API void                     llama_batch_ext_free (struct llama_batch_ext * batch);
     LLAMA_API void                     llama_batch_ext_clear(struct llama_batch_ext * batch);
 

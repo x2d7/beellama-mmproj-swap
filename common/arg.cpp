@@ -1967,6 +1967,61 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--dyn-batch-curve"}, "SPEC",
+        string_format("dynamic prefill ubatch curve as \"kv:ub,kv:ub,...\" (default: %s = disabled)\n"
+            "example: 0:256,16384:192,32768:128,65536:64,98304:48\n"
+            "the physical batch starts at the first point and steps down with KV occupancy",
+            params.dyn_batch_curve.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.dyn_batch_curve = value;
+        }
+    ).set_env("LLAMA_ARG_DYN_BATCH_CURVE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--dyn-batch-ub-min"}, "N",
+        string_format("lower bound of the dynamic ubatch curve (default: %d)", params.dyn_batch_ub_min),
+        [](common_params & params, int value) {
+            params.dyn_batch_ub_min = std::max(1, value);
+        }
+    ).set_env("LLAMA_ARG_DYN_BATCH_UB_MIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--dyn-batch-ub-max"}, "N",
+        string_format("upper bound of the dynamic ubatch curve (default: %d = startup ubatch)", params.dyn_batch_ub_max),
+        [](common_params & params, int value) {
+            params.dyn_batch_ub_max = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_DYN_BATCH_UB_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--dyn-batch-guard-mb"}, "N",
+        string_format("free VRAM to keep while choosing the ubatch (default: %d MiB)", params.dyn_batch_guard_mb),
+        [](common_params & params, int value) {
+            params.dyn_batch_guard_mb = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_DYN_BATCH_GUARD_MB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--dyn-batch-step"}, "N",
+        string_format("minimum ubatch change that triggers a scheduler re-reserve (default: %d)", params.dyn_batch_step),
+        [](common_params & params, int value) {
+            params.dyn_batch_step = std::max(1, value);
+        }
+    ).set_env("LLAMA_ARG_DYN_BATCH_STEP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--dyn-batch-max-drop"}, "N",
+        string_format("maximum ubatch drop per scheduler re-reserve (default: %d = sharp, jump to the target)\n"
+            "set a positive value for smooth stepwise descent", params.dyn_batch_max_drop),
+        [](common_params & params, int value) {
+            params.dyn_batch_max_drop = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_DYN_BATCH_MAX_DROP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-grow"}, "N",
+        string_format("start with N KV cells and grow towards --ctx-size on demand (default: %d = disabled)\n"
+            "growth targets the prompt length plus ~3%% headroom, preserves the cached sequences\n"
+            "and copies the KV state through host memory (a few seconds at 100k cells)", params.ctx_grow),
+        [](common_params & params, int value) {
+            params.ctx_grow = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_CTX_GROW").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {

@@ -21,8 +21,13 @@ struct gpu_swap_manager {
     bool enabled = false;
 
     // How much GPU VRAM we try to free when moving mmproj to GPU (bytes).
-    // Used only for logging / sanity; the KV cache size dictates what is freed.
+    // If freeing the KV cache alone already leaves this much free, the
+    // swappable weight slice stays resident and is not reloaded from disk.
     size_t target_free_bytes = 0;
+
+    // True when the current swap cycle evicted the swappable weight slice.
+    // Only in that case does the restore path have to reload it.
+    bool weights_evicted = false;
 
     std::mutex mtx;
 

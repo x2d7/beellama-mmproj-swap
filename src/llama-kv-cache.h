@@ -514,6 +514,7 @@ private:
         ggml_backend_buffer_type_t                                  gpu_buft = nullptr; // original (GPU) buffer type
         size_t                                                      size = 0;           // original (GPU) buffer size in bytes
         std::vector<std::pair<struct ggml_tensor *, size_t>>        tensors;           // (tensor, offset within buffer) snapshot
+        std::vector<uint8_t>                                        data;              // host copy, kept allocated between swaps
     };
     std::vector<kv_offload_staging> kv_offload_staging_;
     bool                           kv_offloaded_ = false;

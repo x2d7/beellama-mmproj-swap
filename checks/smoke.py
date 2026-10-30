@@ -26,7 +26,7 @@ MODEL = "/home/cyrsia/adisk/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q3_K_XL-nomtp.gguf
 MMPROJ = "/home/cyrsia/adisk/models/Qwen3.8-27B/mmproj-BF16.gguf"
 TEMPLATE = "/home/cyrsia/adisk/models/chat_template.jinja"
 SLOTDIR = "/tmp/opencode/slots"
-LOG = "/tmp/opencode/smoke_server.log"
+LOG = "/tmp/llama_server.log"
 PORT = 10000
 IMG = {d: f"/tmp/opencode/testimgs/d{d}.png" for d in ("1", "2", "3")}
 

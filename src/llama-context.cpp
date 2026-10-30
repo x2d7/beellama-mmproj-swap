@@ -751,6 +751,7 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    n_ubatch_max = cparams.n_ubatch;
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -914,6 +915,10 @@ llama_context::llama_context(
                     ggml_backend_buffer_get_size(buf_output.get()) / 1024.0 / 1024.0);
         }
     }
+
+    mem_type_k   = params.type_k;
+    mem_type_v   = params.type_v;
+    mem_swa_full = params.swa_full;
 
     // init the memory module
     if (!hparams.vocab_only) {
@@ -3766,6 +3771,220 @@ bool llama_context::grow_dflash_swa() {
     }
 }
 
+bool llama_context::grow_ctx(uint32_t new_ctx) {
+    if (new_ctx <= cparams.n_ctx) {
+        return true;
+    }
+    if (cparams.ctx_other != nullptr) {
+        LLAMA_LOG_WARN("%s: context growth is not supported with a shared draft memory\n", __func__);
+        return false;
+    }
+    if (model.hparams.vocab_only || !memory) {
+        return false;
+    }
+
+    auto dbg_free = [](const char * tag) {
+        size_t fb = 0, tb = 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+            ggml_backend_dev_memory(dev, &fb, &tb);
+            break;
+        }
+        fprintf(stderr, "DBGG %s free=%.1f MiB\n", tag, (double) fb / 1024 / 1024);
+        fflush(stderr);
+    };
+
+
+    new_ctx = GGML_PAD(new_ctx, 256);
+
+    dbg_free("before_sync");
+    synchronize();
+    dbg_free("after_sync");
+    ggml_backend_sched_reset(sched.get());
+    // release the compute buffers: the larger cache needs the VRAM, and the
+    // scheduler re-reserves on the next decode
+    ggml_backend_sched_free_buffers(sched.get());
+    dbg_free("after_free_compute");
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
+
+    // estimate the per-token cache cost before the old cache is destroyed
+    double kv_bytes_per_token = 0.0;
+    {
+        const llama_kv_memory_stats stats = llama_get_kv_memory_stats(this);
+        const uint64_t cap  = std::max<uint64_t>(1, stats.global.allocated_capacity_tokens + stats.swa.allocated_capacity_tokens);
+        const uint64_t body = stats.k_payload_bytes() + stats.v_payload_bytes() +
+                stats.global.native_exact_bytes + stats.swa.native_exact_bytes +
+                stats.global.rollback_reserve_bytes + stats.swa.rollback_reserve_bytes;
+        if (body > 0) {
+            kv_bytes_per_token = double(body) / double(cap);
+        }
+    }
+
+    // capture the live sequence state (attention + recurrent) into host memory
+    std::vector<uint8_t> state;
+    {
+        llama_io_write_dummy sizing(false);
+        memory->state_write(sizing, -1, 0);
+        state.resize(sizing.n_bytes());
+        llama_io_write_host writer(state.data(), state.size());
+        memory->state_write(writer, -1, 0);
+        if (writer.n_bytes() != state.size()) {
+            LLAMA_LOG_ERROR("%s: state size changed while capturing\n", __func__);
+            return false;
+        }
+    }
+
+    llama_cparams cparams_new = cparams;
+    cparams_new.n_ctx = new_ctx;
+    if (cparams.kv_unified) {
+        cparams_new.n_ctx_seq = new_ctx;
+    } else {
+        cparams_new.n_ctx_seq = GGML_PAD(new_ctx / cparams.n_seq_max, 256);
+        cparams_new.n_ctx     = cparams_new.n_ctx_seq * cparams.n_seq_max;
+    }
+
+    // the memory modules (KV-tail stride, SWA length, KVarN ring) are sized from
+    // n_ubatch, so build them for the maximum the context may use, not for the
+    // temporarily reduced runtime value
+    const uint32_t ub_runtime = cparams.n_ubatch;
+    if (n_ubatch_max > 0) {
+        cparams_new.n_ubatch = n_ubatch_max;
+    }
+
+    llama_memory_params params_mem = {
+        /*.type_k    =*/ mem_type_k,
+        /*.type_v    =*/ mem_type_v,
+        /*.swa_full  =*/ mem_swa_full,
+        /*.ctx_type  =*/ cparams.ctx_type,
+        /*.kvarn     =*/ cparams.kvarn,
+        /*.kv_tail_tokens =*/ cparams.kv_tail_tokens,
+        /*.kv_tail_tokens_swa =*/ cparams.kv_tail_tokens_swa,
+        /*.kv_tail_tokens_requested =*/ cparams.kv_tail_tokens_requested,
+        /*.kv_tail_tokens_swa_requested =*/ cparams.kv_tail_tokens_swa_requested,
+        /*.kv_tail_native_exact =*/ cparams.kv_tail_native_exact,
+        /*.kv_tail_native_exact_swa =*/ cparams.kv_tail_native_exact_swa,
+        /*.kv_tail_rollback_tokens =*/ cparams.kv_tail_rollback_tokens,
+        /*.kv_tail_type   =*/ cparams.kv_tail_type,
+        /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+    };
+
+    // Free the old cache before allocating the larger one: the state is already
+    // in host memory, and keeping both alive would double the transient VRAM.
+    memory.reset();
+    dbg_free("after_free_kv");
+
+    {
+        size_t fb = 0, tb = 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+            ggml_backend_dev_memory(dev, &fb, &tb);
+            break;
+        }
+        fprintf(stderr, "DBGG free_before_growth=%.1f MiB target=%u cells kv=%.2f KiB/token\n",
+                (double) fb / 1024 / 1024, cparams_new.n_ctx, kv_bytes_per_token / 1024.0);
+        fflush(stderr);
+    }
+
+    // clamp the target to what actually fits now (the recurrent state and the
+    // KVarN staging are allocated by create_memory on top of the records)
+    if (kv_bytes_per_token > 0.0) {
+        size_t free_b = 0, total_b = 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ggml_backend_dev_memory(dev, &free_b, &total_b);
+            break;
+        }
+        const double reserve = 200.0 * 1024 * 1024;
+        const double fit = free_b > reserve ? (double(free_b) - reserve) / kv_bytes_per_token : 0.0;
+        const uint32_t fit_cells = (uint32_t) std::min<double>(double(UINT32_MAX), std::max(0.0, fit));
+        const uint32_t fit_aligned = (fit_cells / 256) * 256;
+        if (fit_aligned < cparams_new.n_ctx) {
+            fprintf(stderr, "DBGG clamp fit=%u requested=%u free=%.1f reserve=%.0f\n",
+                    fit_aligned, cparams_new.n_ctx, (double) free_b / 1024 / 1024, reserve / 1024 / 1024);
+            fflush(stderr);
+            cparams_new.n_ctx = fit_aligned;
+            cparams_new.n_ctx_seq = cparams.kv_unified ? fit_aligned
+                    : GGML_PAD(fit_aligned / cparams.n_seq_max, 256);
+            cparams_new.n_ctx = cparams.kv_unified ? fit_aligned
+                    : cparams_new.n_ctx_seq * cparams.n_seq_max;
+        }
+        if (cparams_new.n_ctx <= cparams.n_ctx) {
+            LLAMA_LOG_WARN("%s: not enough free VRAM to grow beyond %u cells\n", __func__, cparams.n_ctx);
+            llama_memory_i * mem_old = model.create_memory(params_mem, cparams);
+            if (mem_old != nullptr) {
+                try {
+                    llama_io_read_host reader(state.data(), state.size());
+                    mem_old->state_read(reader, -1, 0);
+                    reader.commit();
+                    memory.reset(mem_old);
+                } catch (...) {
+                    delete mem_old;
+                }
+            }
+            return false;
+        }
+    }
+
+    llama_memory_i * mem_new = model.create_memory(params_mem, cparams_new);
+    if (mem_new == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to create memory for %u cells, restoring %u\n",
+                __func__, cparams_new.n_ctx, cparams.n_ctx);
+        // recover the previous cache from the captured state
+        llama_memory_i * mem_old = model.create_memory(params_mem, cparams);
+        if (mem_old != nullptr) {
+            try {
+                llama_io_read_host reader(state.data(), state.size());
+                mem_old->state_read(reader, -1, 0);
+                reader.commit();
+                memory.reset(mem_old);
+            } catch (...) {
+                delete mem_old;
+            }
+        }
+        return false;
+    }
+    try {
+        llama_io_read_host reader(state.data(), state.size());
+        mem_new->state_read(reader, -1, 0);
+        if (reader.n_bytes() != state.size()) {
+            throw std::runtime_error("state was not fully consumed");
+        }
+        reader.commit();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to restore state into the larger cache: %s\n", __func__, err.what());
+        delete mem_new;
+        return false;
+    }
+
+    LLAMA_LOG_INFO("%s: grew context from %u to %u cells (state %.1f MiB)\n",
+            __func__, cparams.n_ctx, cparams_new.n_ctx, (double) state.size() / 1024 / 1024);
+
+    memory.reset(mem_new);
+    cparams = cparams_new;
+    cparams.n_ubatch = ub_runtime;
+    sched_need_reserve = true;
+    return true;
+}
+
+void llama_set_n_ctx(struct llama_context * ctx, uint32_t n_ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+    if (!ctx->grow_ctx(n_ctx)) {
+        LLAMA_LOG_WARN("%s: could not grow the context to %u\n", __func__, n_ctx);
+    }
+}
+
 class llama_io_write_file : public llama_io_write_i {
 public:
     llama_io_write_file(llama_file * f) : file(f) {}
@@ -5230,6 +5449,33 @@ uint32_t llama_n_batch(const llama_context * ctx) {
 
 uint32_t llama_n_ubatch(const llama_context * ctx) {
     return ctx->n_ubatch();
+}
+
+void llama_context::set_n_ubatch(uint32_t n_ubatch) {
+    if (n_ubatch == 0) {
+        n_ubatch = 1;
+    }
+    if (n_ubatch_max > 0) {
+        n_ubatch = std::min(n_ubatch, n_ubatch_max);
+    }
+    n_ubatch = std::min(n_ubatch, cparams.n_batch);
+    if (cparams.n_rs_seq > 0) {
+        n_ubatch = std::max(n_ubatch, cparams.n_rs_seq + 1);
+    }
+    if (n_ubatch == cparams.n_ubatch) {
+        return;
+    }
+    LLAMA_LOG_DEBUG("%s: n_ubatch %u -> %u (max %u)\n", __func__, cparams.n_ubatch, n_ubatch, n_ubatch_max);
+    cparams.n_ubatch = n_ubatch;
+    // applied by decode() -> sched_reserve() before the batch is split
+    sched_need_reserve = true;
+}
+
+void llama_set_n_ubatch(struct llama_context * ctx, uint32_t n_ubatch) {
+    if (ctx == nullptr) {
+        return;
+    }
+    ctx->set_n_ubatch(n_ubatch);
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {

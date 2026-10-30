@@ -7876,73 +7876,58 @@ bool llama_kv_cache::offload_to_cpu() {
         return true;
     }
 
-    kv_offload_staging_.clear();
-    kv_offload_staging_.reserve(ctxs_bufs.size());
+    const size_t n_bufs = ctxs_bufs.size();
+    if (kv_offload_staging_.size() != n_bufs) {
+        kv_offload_staging_.clear();
+        kv_offload_staging_.resize(n_bufs);
+    }
 
-    for (auto & kv : ctxs_bufs) {
-        ggml_context_ptr & ctx = kv.first;
-        ggml_backend_buffer_ptr & buf = kv.second;
+    for (size_t i = 0; i < n_bufs; i++) {
+        ggml_context_ptr & ctx = ctxs_bufs[i].first;
+        ggml_backend_buffer_ptr & buf = ctxs_bufs[i].second;
+        kv_offload_staging & s = kv_offload_staging_[i];
+
+        s.tensors.clear();
+        s.size = 0;
 
         if (!buf) {
-            kv_offload_staging_.push_back(kv_offload_staging());
             continue;
         }
 
         const ggml_backend_buffer_type_t gpu_buft = ggml_backend_buffer_get_type(buf.get());
         const size_t size = ggml_backend_buffer_get_size(buf.get());
+        s.gpu_buft = gpu_buft;
 
-        // skip dummy/empty buffers (nothing to move)
         if (size == 0) {
-            kv_offload_staging s;
-            s.gpu_buft = gpu_buft;
-            kv_offload_staging_.push_back(std::move(s));
             continue;
         }
 
         uint8_t * gpu_base = (uint8_t *)ggml_backend_buffer_get_base(buf.get());
 
-        // remember each tensor's offset within the buffer (before we detach it)
-        std::vector<std::pair<struct ggml_tensor *, size_t>> tensors;
         for (struct ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
             if (t->data == nullptr) continue;
-            tensors.emplace_back(t, (uint8_t *)t->data - gpu_base);
+            s.tensors.emplace_back(t, (uint8_t *)t->data - gpu_base);
         }
 
-        // 1) copy current (GPU) KV contents to a host staging buffer
-        std::vector<uint8_t> data(size);
-        for (auto & p : tensors) {
-            ggml_backend_tensor_get(p.first, data.data() + p.second, 0, ggml_nbytes(p.first));
+        // the host copy is the only copy: it stays allocated between swaps so
+        // its pages remain warm and no intermediate CPU buffer is needed
+        if (s.data.size() != size) {
+            s.data.resize(size);
+        }
+        s.size = size;
+
+        for (auto & p : s.tensors) {
+            ggml_backend_tensor_get(p.first, s.data.data() + p.second, 0, ggml_nbytes(p.first));
         }
 
-        // 2) free the GPU buffer and detach the tensors
         buf.reset();
-        for (auto & p : tensors) {
+        for (auto & p : s.tensors) {
             p.first->buffer = nullptr;
             p.first->data   = nullptr;
         }
 
-        // 3) allocate a CPU buffer of the same size and place the tensors at
-        //    their original offsets (preserving the buffer layout)
         LLAMA_LOG_INFO("%s: offloaded KV buffer to CPU: size=%.2f MiB, tensors=%zu\n",
-                __func__, (double)size / 1024.0 / 1024.0, tensors.size());
-        ggml_backend_buffer_t cpu_buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type());
-        if (cpu_buf == nullptr) {
-            LLAMA_LOG_ERROR("%s: failed to allocate CPU buffer for KV offload\n", __func__);
-            return false;
-        }
-
-        // 4) copy the host KV contents into the CPU buffer
-        for (auto & p : tensors) {
-            ggml_backend_tensor_set(p.first, data.data() + p.second, 0, ggml_nbytes(p.first));
-        }
-
-        kv_offload_staging s;
-        s.gpu_buft = gpu_buft;
-        s.size     = size;
-        s.tensors  = std::move(tensors);
-        kv_offload_staging_.push_back(std::move(s));
-
-        buf = ggml_backend_buffer_ptr(cpu_buf);
+                __func__, (double) size / 1024.0 / 1024.0, s.tensors.size());
     }
 
     kv_offloaded_ = true;
@@ -7964,40 +7949,27 @@ bool llama_kv_cache::restore_to_gpu() {
         ggml_backend_buffer_ptr & buf = ctxs_bufs[i].second;
         const kv_offload_staging & s = kv_offload_staging_[i];
 
-        if (!buf) {
+        if (s.size == 0) {
             continue;
         }
-
-        // 1) copy current (CPU) KV contents to host, keyed by the ORIGINAL offsets
-        std::vector<uint8_t> data(s.size);
-        for (const auto & p : s.tensors) {
-            ggml_backend_tensor_get(p.first, data.data() + p.second, 0, ggml_nbytes(p.first));
+        if (s.data.size() != s.size) {
+            LLAMA_LOG_ERROR("%s: staging data size mismatch, refusing restore\n", __func__);
+            return false;
         }
 
-        // 2) free the CPU buffer and detach tensors
-        buf.reset();
-        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-            t->buffer = nullptr;
-            t->data   = nullptr;
-        }
-
-        // 3) reallocate on the original GPU backend
         ggml_backend_buffer_t gpu_buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), s.gpu_buft);
         if (gpu_buf == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to reallocate GPU buffer for KV restore\n", __func__);
             return false;
         }
-
-        // 4) copy the preserved KV contents back into the GPU buffer, using the
-        //    original offsets so the new (possibly re-packed) layout is irrelevant
-        for (const auto & p : s.tensors) {
-            ggml_backend_tensor_set(p.first, data.data() + p.second, 0, ggml_nbytes(p.first));
-        }
-
         buf = ggml_backend_buffer_ptr(gpu_buf);
+
+        for (const auto & p : s.tensors) {
+            ggml_backend_tensor_set(p.first, s.data.data() + p.second, 0, ggml_nbytes(p.first));
+        }
     }
 
-    kv_offload_staging_.clear();
+    
     kv_offloaded_ = false;
     return true;
 }

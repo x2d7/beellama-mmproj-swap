@@ -163,3 +163,6 @@ AGENTS.local.md
 /artifacts/
 /release-packages/*/
 /servers
+
+# local A/B binaries
+baseline-bin/

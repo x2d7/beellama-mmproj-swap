@@ -2,9 +2,11 @@
 
 > **Changes from the base repository.** This fork adds the following on top of the base BeeLlama.cpp:
 >
-> - **`--mmproj-gpu-swap`** — the vision projector stays on CPU and is uploaded to VRAM only while images are being encoded; the KV cache temporarily moves to host RAM to make room. All images from the request are encoded during a single swap cycle — no repeated offload/restore mid-batch.
-> - **Swappable weight slice** (`--mmproj-gpu-swap-reserve-mb`) — a slice of the main-model weights lives in a dedicated buffer that is evicted from VRAM during image encoding and reloaded from disk afterwards, so even a model that barely fits can still serve images without an encoder OOM.
+> - **`--mmproj-gpu-swap`** — the vision projector stays on CPU and is uploaded to VRAM only while images are being encoded; the KV cache temporarily moves to host RAM to make room (one host copy, no CPU-buffer round trip). All images from the request are encoded during a single swap cycle — no repeated offload/restore mid-batch.
+> - **Swappable weight slice** (`--mmproj-gpu-swap-reserve-mb`) — a slice of the main-model weights lives in a dedicated buffer that can be evicted from VRAM for image encoding. It is evicted only when offloading the KV cache is not enough, so the common case never pays the reload-from-disk cost.
 > - **Image progress logs** — multi-image batches report `image encoding, n_images = 1/5 … 5/5` and `image decoding, …` in the server's `print_timing` style instead of silence.
+> - **Dynamic batch for prefill** (`--dyn-batch-curve`, `--dyn-batch-guard-mb`, `--dyn-batch-step`, `--dyn-batch-max-drop`, `--dyn-batch-ub-min`) — two-tier batching: the free logical-batch tier adjusts, and `llama_set_n_ubatch()` shrinks the physical ubatch only when VRAM demands it, between decodes and never inside one. Works with an automatic free-VRAM curve or an explicit `kv:ub` plan per depth.
+> - **Context growth** (`--ctx-grow`) — start with a smaller KV cache and grow it towards `--ctx-size` on demand, preserving the cached sequences and re-sizing the ubatch afterwards. Slot restore grows first when the checkpoint holds more tokens than the current capacity.
 
 ![BeeLlama.cpp logo](beellama.jpg)
 

@@ -33,8 +33,8 @@ def swaps(path=None):
     return (sum(1 for l in lines if "swapping mmproj to GPU" in l),
             sum(1 for l in lines if "swapping mmproj back to CPU" in l))
 
-LOG_A = "/tmp/opencode/mtmd-ckpt-a.log"
-LOG_B = "/tmp/opencode/mtmd-ckpt-b.log"
+LOG_A = "/tmp/llama_server.log"
+LOG_B = "/tmp/llama_server.log"
 NAME = "mtmd-ckpt.bin"
 
 

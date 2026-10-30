@@ -730,6 +730,17 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t rs_rollback         = 0;     // recurrent-state snapshots per sequence, enables prompt-cache rollback on hybrid models
+
+    // dynamic prefill batching (see docs/dyn-batch.md)
+    std::string dyn_batch_curve = "off"; // "kv:ub,kv:ub,..." or "off"
+    int32_t dyn_batch_ub_min    = 48;
+    int32_t dyn_batch_ub_max    = 0;     // 0 = the context's startup ubatch
+    int32_t dyn_batch_guard_mb  = 300;   // keep at least this much free VRAM
+    int32_t dyn_batch_step      = 16;    // deadband between cap changes
+    int32_t dyn_batch_max_drop  = 0;     // 0 = sharp (jump to target), >0 = smooth
+
+    // dynamic KV capacity: start at `ctx_grow` cells and grow towards --ctx-size
+    int32_t ctx_grow            = 0;     // 0 = disabled (allocate --ctx-size up front)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
@@ -1232,6 +1243,9 @@ struct common_batch {
 
     // render entries [off, off + n) into batch, the result is overwritten by the next call
     llama_batch_ext * get_sub_batch(int32_t off, int32_t n);
+
+    // refresh the cached memory module pointer after an in-place context growth
+    void set_mem(llama_memory_t mem);
 
     // content type of the batch, all entries carry the same combination
     bool has_token() const { return !tokens.empty() && tokens[0].id != LLAMA_TOKEN_NULL; }

@@ -6,6 +6,7 @@
 #include "server-adaptive-dm.h"
 #include "server-common.h"
 #include "server-decision.h"
+#include "server-dyn-batch.h"
 #include "server-http.h"
 #include "server-loop-guard.h"
 #include "server-task.h"
@@ -17,6 +18,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "ggml-backend.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1333,6 +1335,14 @@ public:
     // partial model-layer offload to free VRAM for mmproj during image encoding
     gpu_swap_manager swap_mgr;
 
+    // dynamic prefill batching: ubatch follows KV occupancy and free VRAM
+    server_dyn_batch dyn_batch;
+
+    // dynamic KV capacity: --ctx-size is the maximum, --ctx-grow the initial size
+    int32_t n_ctx_max = 0;
+    int64_t dyn_sample_us = 0;   // last progress sample (µs)
+    int32_t dyn_sample_kv = 0;   // KV tokens at the last sample
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -1658,6 +1668,17 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // dynamic KV capacity: allocate only the initial cells, keep --ctx-size as the ceiling
+        if (params_base.ctx_grow > 0) {
+            n_ctx_max = params_base.n_ctx;
+            if (n_ctx_max > params_base.ctx_grow) {
+                params_base.n_ctx = std::max<int32_t>(512, params_base.ctx_grow);
+                SRV_INF("ctx-grow: starting with %d cells, max %d\n", params_base.n_ctx, n_ctx_max);
+            } else {
+                n_ctx_max = 0;
+            }
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -1674,6 +1695,21 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        if (dyn_batch.configure(params_base.dyn_batch_curve, llama_n_ubatch(ctx_tgt))) {
+            const uint32_t ub_ctor = dyn_batch.ub_max;
+            dyn_batch.ub_min = (uint32_t) std::min<int32_t>(
+                    std::max(1, params_base.dyn_batch_ub_min), (int32_t) ub_ctor);
+            if (params_base.dyn_batch_ub_max > 0) {
+                dyn_batch.ub_max = std::min<uint32_t>(dyn_batch.ub_max, (uint32_t) params_base.dyn_batch_ub_max);
+            }
+            dyn_batch.ub_max = std::max(dyn_batch.ub_max, dyn_batch.ub_min);
+            dyn_batch.guard_mb = params_base.dyn_batch_guard_mb;
+            dyn_batch.step = (uint32_t) std::max(1, params_base.dyn_batch_step);
+            dyn_batch.max_drop = (uint32_t) std::max(0, params_base.dyn_batch_max_drop);
+            SRV_INF("dyn-batch: curve enabled, ubatch %u..%u, guard %d MiB, step %u\n",
+                    dyn_batch.ub_min, dyn_batch.ub_max, dyn_batch.guard_mb, dyn_batch.step);
+        }
 
         try {
             decision.init(model_tgt);
@@ -1758,7 +1794,9 @@ private:
                 swap_mgr.enabled = true;
                 // Free enough VRAM to fit the mmproj weights (~1.1 GiB) plus the
                 // inference compute buffer (~0.25 GiB) and a safety margin.
-                swap_mgr.target_free_bytes = (size_t)2800 * 1024 * 1024;
+                // The swappable weight slice is only evicted when offloading the
+                // KV cache does not already leave this much free.
+                swap_mgr.target_free_bytes = (size_t)1700 * 1024 * 1024;
             }
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
@@ -2348,7 +2386,98 @@ private:
         return output;
     }
 
+    // Effective context limit for admission checks: the growth ceiling when
+    // --ctx-grow is active, otherwise the current capacity.
+    int ctx_admit_limit(const server_slot & slot) const {
+        return n_ctx_max > 0 ? n_ctx_max : slot.n_ctx;
+    }
+
+    // Grow the KV capacity only when the next prompt chunk no longer fits.
+    // Earlier chunks are processed with the full ubatch, so the expensive copy
+    // and the ubatch step-down happen as late as possible.
+    void ctx_grow_if_needed(server_slot & slot, int32_t n_batch_cap) {
+        if (n_ctx_max <= 0 || ctx_tgt == nullptr || slot.task == nullptr) {
+            return;
+        }
+        const int64_t cur = llama_n_ctx(ctx_tgt);
+        if (cur <= 0 || cur >= n_ctx_max) {
+            return;
+        }
+        const int64_t used     = slot.prompt.n_tokens();
+        const int64_t task_n   = slot.task->n_tokens();
+        const int64_t next_end = std::min<int64_t>(used + std::max<int32_t>(n_batch_cap, 1), task_n);
+        if (next_end + 1 <= cur) {
+            return; // the next chunk still fits
+        }
+        // Grow to what this prompt actually needs plus ~10% headroom, never
+        // straight to the maximum: a cache sized for the prompt keeps the
+        // ubatch large, while a jump to n_ctx_max starves it (98k with ub 102
+        // instead of 92k with ub 600).
+        int64_t target = std::max<int64_t>(task_n + 2048, (int64_t) (task_n * 1.03));
+        ctx_grow_to(target);
+    }
+
+    // Grow the KV capacity to at least `target` cells (capped by --ctx-size).
+    void ctx_grow_to(int64_t target) {
+        if (n_ctx_max <= 0 || ctx_tgt == nullptr) {
+            return;
+        }
+        const int64_t cur = llama_n_ctx(ctx_tgt);
+        if (cur <= 0 || cur >= n_ctx_max) {
+            return;
+        }
+        target = std::min<int64_t>(target, n_ctx_max);
+        if (target <= cur) {
+            return;
+        }
+        // growth frees the compute buffers itself; the controller then picks the
+        // largest ubatch that still fits, so the memory comes out of the ubatch
+        // measure the compute cost per ubatch token before the scheduler is torn down
+        const double c_ub = dyn_batch.enabled() ? dyn_compute_mb_per_ub() : -1.0;
+        const int64_t t_grow0 = ggml_time_us();
+        llama_set_n_ctx(ctx_tgt, (uint32_t) target);
+        const double t_grow_ms = (ggml_time_us() - t_grow0) / 1000.0;
+        const uint32_t got = llama_n_ctx(ctx_tgt);
+        if (got <= cur) {
+            SRV_WRN("ctx-grow: could not grow context from %d to %d cells\n", (int) cur, (int) target);
+            return;
+        }
+        n_ctx = got;
+        for (auto & s : slots) {
+            s.n_ctx = n_ctx_slot();
+        }
+        batch.view.set_mem(llama_get_memory(ctx_tgt));
+
+        // growth released the compute buffers: with an explicit curve the
+        // ubatch follows the planned (ctx, ub) pair for the new capacity; with
+        // the runtime curve it is sized from the free VRAM that is actually
+        // available now, not from the pre-growth reserve
+        if (dyn_batch.enabled()) {
+            const int64_t free_mb = dyn_free_mb();
+            const double c = c_ub;
+            const uint32_t cur_ub = llama_n_ubatch(ctx_tgt);
+            uint32_t ub_next = cur_ub;
+            if (!dyn_batch.auto_curve) {
+                ub_next = std::min(cur_ub, dyn_batch.target((uint64_t) got));
+            } else if (free_mb > 0 && c > 0.0) {
+                uint32_t ub_fit = (uint32_t) std::max<double>(0.0, (double) (free_mb) - 96.0) / c;
+                ub_fit = std::max(ub_fit, dyn_batch.ub_min);
+                ub_fit = std::min(ub_fit, cur_ub);
+                ub_next = ub_fit;
+            }
+            if (ub_next != cur_ub) {
+                llama_set_n_ubatch(ctx_tgt, ub_next);
+                SRV_INF("ctx-grow: ubatch -> %u after growth (free=%lld MiB, curve=%s)\n",
+                        ub_next, (long long) free_mb, dyn_batch.auto_curve ? "auto" : "explicit");
+            }
+        }
+
+        SRV_INF("ctx-grow: grew context %d -> %u cells (%.0f ms)\n",
+                (int) cur, got, t_grow_ms);
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -3194,6 +3323,97 @@ private:
         return n_tokens >= 0 && n_tokens%alignment == 0;
     }
 
+    // free VRAM of the first GPU, MiB (-1 if unknown)
+    int64_t dyn_free_mb() const {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            size_t f = 0, t = 0;
+            ggml_backend_dev_memory(dev, &f, &t);
+            return (int64_t) (f / (1024 * 1024));
+        }
+        return -1;
+    }
+
+    // measured scheduler compute buffer per ubatch token, MiB
+    double dyn_compute_mb_per_ub() const {
+        ggml_backend_sched_t sched = llama_context_get_sched(ctx_tgt);
+        if (sched == nullptr) {
+            return -1.0;
+        }
+        size_t total = 0;
+        const int n_backends = ggml_backend_sched_get_n_backends(sched);
+        for (int i = 0; i < n_backends; i++) {
+            total += ggml_backend_sched_get_buffer_size(sched, ggml_backend_sched_get_backend(sched, i));
+        }
+        const uint32_t cur = llama_n_ubatch(ctx_tgt);
+        if (cur == 0 || total == 0) {
+            return -1.0;
+        }
+        return double(total) / (1024.0 * 1024.0) / double(cur);
+    }
+
+    // Choose the ubatch for this prompt iteration and apply it between decodes.
+    void dyn_batch_sync(server_slot & slot, bool new_prompt, int32_t & n_batch, int32_t & n_ubatch) {
+        if (!dyn_batch.enabled() || ctx_tgt == nullptr) {
+            return;
+        }
+        if (slot.task && slot.task->tokens.has_mtmd) {
+            return; // image chunks must stay inside one ubatch
+        }
+
+        uint32_t cur = llama_n_ubatch(ctx_tgt);
+        const int32_t n_kv = slot.prompt.n_tokens();
+        const int64_t now_us = ggml_time_us();
+
+        // progress sample: instantaneous prefill rate over the last ~2048 tokens
+        if (new_prompt) {
+            dyn_sample_us = now_us;
+            dyn_sample_kv = n_kv;
+        } else if (dyn_sample_us > 0 && n_kv - dyn_sample_kv >= 2048) {
+            const double dt = double(now_us - dyn_sample_us) / 1e6;
+            const int32_t dk = n_kv - dyn_sample_kv;
+            SLT_INF(slot, "dyn-sample pct=%.1f kv=%d ub=%u rate=%.1f dt=%.2f\n",
+                    slot.n_ctx > 0 ? 100.0 * n_kv / slot.n_ctx : 0.0, n_kv, cur,
+                    dt > 0.0 ? dk / dt : 0.0, dt);
+            dyn_sample_us = now_us;
+            dyn_sample_kv = n_kv;
+        }
+
+        const int64_t free_mb = dyn_free_mb();
+        // while the context can still grow, keep VRAM reserved for the copy
+        const int64_t grow_reserve_mb = 0;
+        uint32_t t = dyn_batch.auto_curve
+                ? dyn_batch.plan_auto((uint64_t) slot.prompt.n_tokens(), free_mb,
+                        dyn_compute_mb_per_ub(), cur, grow_reserve_mb)
+                : dyn_batch.plan((uint64_t) slot.prompt.n_tokens(), free_mb);
+        // occupancy only grows inside a prompt: the ubatch may step down, never up
+        if (!new_prompt) {
+            t = std::min(t, cur);
+        }
+
+        if (new_prompt) {
+            if (t != cur) {
+                llama_set_n_ubatch(ctx_tgt, t);
+                cur = llama_n_ubatch(ctx_tgt);
+                SLT_INF(slot, "dyn-batch: new prompt, ubatch -> %u (free=%lld MiB)\n", cur, (long long) free_mb);
+            }
+        } else if (dyn_batch.should_apply(cur, t)) {
+            uint32_t next = t;
+            if (dyn_batch.max_drop > 0 && cur > t + dyn_batch.max_drop) {
+                next = cur - dyn_batch.max_drop;
+            }
+            llama_set_n_ubatch(ctx_tgt, next);
+            cur = llama_n_ubatch(ctx_tgt);
+            SLT_INF(slot, "dyn-batch: kv=%d free=%lld MiB, ubatch -> %u\n",
+                    slot.prompt.n_tokens(), (long long) free_mb, cur);
+        }
+        n_ubatch = (int32_t) cur;
+        n_batch   = std::min(n_batch, (int32_t) cur);
+    }
+
     size_t prompt_live_native_restorable(
             const server_slot & slot,
             const server_tokens & requested) const {
@@ -3885,6 +4105,16 @@ private:
                         size_t n_packed = 0;
                         if (!llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed)) {
                             throw std::runtime_error("Invalid slot save file");
+                        }
+                        // --ctx-grow: the saved slot may hold more tokens than the
+                        // starting capacity; grow before asking for restore space
+                        if (n_ctx_max > 0 && ctx_tgt != nullptr) {
+                            const int64_t cur = llama_n_ctx(ctx_tgt);
+                            if (cur > 0 && cur < n_ctx_max && (int64_t) n_packed + 1 > cur) {
+                                SRV_INF("ctx-grow: saved slot has %zu tokens, current ctx %d\n",
+                                        n_packed, (int) cur);
+                                ctx_grow_to(std::max<int64_t>((int64_t) n_packed + 1024, cur * 2));
+                            }
                         }
                         llama_tokens packed(std::max<size_t>(1, n_packed));
                         using memory_plan_ptr = std::unique_ptr<llama_state_seq_restore_plan,
@@ -4685,6 +4915,12 @@ private:
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
 
+                    ctx_grow_if_needed(slot, n_batch);
+
+                    if (dyn_batch.enabled()) {
+                        dyn_batch_sync(slot, slot.state == SLOT_STATE_STARTED, n_batch, n_ubatch);
+                    }
+
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
@@ -4745,17 +4981,17 @@ private:
                                     slot,
                                     string_format(
                                         "input (%d tokens) is larger than the max context size (%d tokens). skipping",
-                                        slot.task->n_tokens(), slot.n_ctx),
+                                        slot.task->n_tokens(), ctx_admit_limit(slot)),
                                     ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
                                 return;
                             }
                         } else {
-                            if (slot.task->n_tokens() >= slot.n_ctx) {
+                            if (slot.task->n_tokens() >= ctx_admit_limit(slot)) {
                                 send_error(slot,
                                            string_format("request (%d tokens) exceeds the available context size (%d "
                                                          "tokens), try increasing it",
-                                                         slot.task->n_tokens(), slot.n_ctx),
+                                                         slot.task->n_tokens(), ctx_admit_limit(slot)),
                                            ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
                                 return;

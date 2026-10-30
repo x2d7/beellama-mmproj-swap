@@ -2360,6 +2360,12 @@ bool common_replay_last_token(struct llama_context * ctx, llama_token last_token
     return true;
 }
 
+void common_batch::set_mem(llama_memory_t mem) {
+    if (batch) {
+        llama_batch_ext_set_mem(batch.get(), mem);
+    }
+}
+
 common_batch::common_batch(llama_context * ctx) : batch(llama_batch_ext_init(ctx)) {
     const auto rope_type = llama_model_rope_type(llama_get_model(ctx));
     n_pos = rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? GGML_MROPE_SECTIONS : 1;

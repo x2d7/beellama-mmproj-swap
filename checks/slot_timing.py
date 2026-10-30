@@ -119,8 +119,8 @@ def main():
     prompt = make_prompt(args.tokens)
     name = f"upgrade-{args.label}.bin"
     path = os.path.join(SLOTDIR, name)
-    log1 = f"/tmp/opencode/slot-{args.label}-1.log"
-    log2 = f"/tmp/opencode/slot-{args.label}-2.log"
+    log1 = "/tmp/llama_server.log"
+    log2 = "/tmp/llama_server.log"
     out = {"label": args.label, "bin": args.bin_dir, "target_tokens": args.tokens}
     dbg = {}
 
