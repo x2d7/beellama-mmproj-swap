@@ -757,6 +757,12 @@ extern "C" {
     // alignment. Returns silently on failure (the context keeps its size).
     // Growth rebuilds the memory modules and requires an empty decode queue.
     LLAMA_API void     llama_set_n_ctx(struct llama_context * ctx, uint32_t n_ctx);
+
+    // Resize the KV capacity. Growing preserves the cached sequences; shrinking
+    // is only possible while the cache is empty (allow_shrink) and is meant to
+    // trade cache capacity back for a larger ubatch after the context was
+    // invalidated.
+    LLAMA_API void     llama_resize_ctx(struct llama_context * ctx, uint32_t n_ctx, bool allow_shrink);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 

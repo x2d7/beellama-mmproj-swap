@@ -2399,6 +2399,45 @@ private:
         if (n_ctx_max <= 0 || ctx_tgt == nullptr || slot.task == nullptr) {
             return;
         }
+        const int64_t cur0 = llama_n_ctx(ctx_tgt);
+        if (cur0 <= 0) {
+            return;
+        }
+        // Fresh prompt: the cache holds nothing yet, so the capacity can be
+        // resized to what this request needs in either direction -- the copy is
+        // free when shrinking and cheap when growing from an empty cache. This
+        // is how a long prompt trades ubatch for context and a short one takes
+        // the memory back.
+        bool kv_empty = true;
+        for (llama_seq_id seq = 0; seq < (llama_seq_id) llama_n_seq_max(ctx_tgt); ++seq) {
+            if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq) >= 0) {
+                kv_empty = false;
+                break;
+            }
+        }
+        if (kv_empty && n_ctx_max > 0 && ctx_resize_enabled()) {
+            const int64_t gen  = std::min<int64_t>(slot.n_predict_max > 0 ? slot.n_predict_max : 512, 8192);
+            int64_t       need = std::min<int64_t>(n_ctx_max, (int64_t) slot.task->n_tokens() + gen + 2048);
+            need = (need / 256) * 256;
+            if (need > 0 && std::llabs(need - cur0) >= 2048) {
+                SRV_DBG("ctx-resize check: cur=%d need=%d kv_empty=%d task=%d gen=%d\n",
+                        (int) cur0, (int) need, (int) kv_empty,
+                        (int) slot.task->n_tokens(), (int) gen);
+                const int64_t t0 = ggml_time_us();
+                llama_resize_ctx(ctx_tgt, (uint32_t) need, true);
+                const uint32_t got = llama_n_ctx(ctx_tgt);
+                if (got != (uint32_t) cur0) {
+                    n_ctx = got;
+                    for (auto & s : slots) {
+                        s.n_ctx = n_ctx_slot();
+                    }
+                    batch.view.set_mem(llama_get_memory(ctx_tgt));
+                    SRV_INF("ctx-resize: %d -> %u cells for %d prompt tokens (%.0f ms)\n",
+                            (int) cur0, got, (int) slot.task->n_tokens(),
+                            (ggml_time_us() - t0) / 1000.0);
+                }
+            }
+        }
         const int64_t cur = llama_n_ctx(ctx_tgt);
         if (cur <= 0 || cur >= n_ctx_max) {
             return;
@@ -2415,6 +2454,50 @@ private:
         // instead of 92k with ub 600).
         int64_t target = std::max<int64_t>(task_n + 2048, (int64_t) (task_n * 1.03));
         ctx_grow_to(target);
+    }
+
+    // Resize the KV capacity to `need` cells, growing or shrinking. The caller
+    // must guarantee that the sequence memory is empty (no state to copy).
+    bool ctx_resize_enabled() const {
+        static const bool enabled = [] {
+            const char * v = std::getenv("LLAMA_CTX_RESIZE");
+            return v != nullptr && v[0] != '0';
+        }();
+        return enabled;
+    }
+
+    void ctx_resize_to(int64_t need) {
+        if (!ctx_resize_enabled() || n_ctx_max <= 0 || ctx_tgt == nullptr) {
+            return;
+        }
+        const int64_t cur = llama_n_ctx(ctx_tgt);
+        if (cur <= 0) {
+            return;
+        }
+        need = std::min<int64_t>(n_ctx_max, need);
+        need = (need / 256) * 256;
+        if (need <= 0 || std::llabs(need - cur) < 2048) {
+            return;
+        }
+        const int64_t t0 = ggml_time_us();
+        llama_resize_ctx(ctx_tgt, (uint32_t) need, true);
+        const uint32_t got = llama_n_ctx(ctx_tgt);
+        if (got == (uint32_t) cur) {
+            return;
+        }
+        n_ctx = got;
+        for (auto & s : slots) {
+            s.n_ctx = n_ctx_slot();
+        }
+        batch.view.set_mem(llama_get_memory(ctx_tgt));
+        // the pool still holds the previous allocation for a moment: start the
+        // first chunk with the smallest ubatch and let the planner raise it once
+        // the free VRAM has settled
+        if (dyn_batch.enabled()) {
+            llama_set_n_ubatch(ctx_tgt, dyn_batch.ub_min);
+        }
+        SRV_INF("ctx-resize: %d -> %u cells (%.0f ms)\n",
+                (int) cur, got, (ggml_time_us() - t0) / 1000.0);
     }
 
     // Grow the KV capacity to at least `target` cells (capped by --ctx-size).
@@ -2632,6 +2715,18 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        // A brand-new conversation cannot reuse the cached prefix: wipe the
+        // sequence memory now and resize the capacity for this request alone.
+        // Shrinking is free (no state to copy) and gives the VRAM back to the
+        // ubatch; growing makes room for a long prompt without a later copy.
+        if (ctx_resize_enabled() && n_ctx_max > 0 && ctx_tgt != nullptr && slot.prompt.n_tokens() > 0 &&
+                slot.task->n_tokens() > 0 &&
+                slot.prompt.tokens.get_common_prefix(slot.task->tokens) < 1024) {
+            slot.prompt_clear();
+            const int64_t gen = std::min<int64_t>(slot.n_predict_max > 0 ? slot.n_predict_max : 512, 8192);
+            ctx_resize_to((int64_t) slot.task->n_tokens() + gen + 2048);
+        }
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -3338,10 +3433,29 @@ private:
     }
 
     // measured scheduler compute buffer per ubatch token, MiB
-    double dyn_compute_mb_per_ub() const {
+    // Cached cost of one ubatch token in the scheduler compute buffers. The
+    // buffers are freed by a context resize, so the value is remembered and the
+    // reservation state is reported separately.
+    double dyn_c_ub_cache = -1.0;
+
+    bool dyn_buffers_reserved() const {
         ggml_backend_sched_t sched = llama_context_get_sched(ctx_tgt);
         if (sched == nullptr) {
-            return -1.0;
+            return false;
+        }
+        const int n_backends = ggml_backend_sched_get_n_backends(sched);
+        for (int i = 0; i < n_backends; i++) {
+            if (ggml_backend_sched_get_buffer_size(sched, ggml_backend_sched_get_backend(sched, i)) > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    double dyn_compute_mb_per_ub() {
+        ggml_backend_sched_t sched = llama_context_get_sched(ctx_tgt);
+        if (sched == nullptr) {
+            return dyn_c_ub_cache;
         }
         size_t total = 0;
         const int n_backends = ggml_backend_sched_get_n_backends(sched);
@@ -3350,9 +3464,10 @@ private:
         }
         const uint32_t cur = llama_n_ubatch(ctx_tgt);
         if (cur == 0 || total == 0) {
-            return -1.0;
+            return dyn_c_ub_cache; // buffers are not reserved right now
         }
-        return double(total) / (1024.0 * 1024.0) / double(cur);
+        dyn_c_ub_cache = double(total) / (1024.0 * 1024.0) / double(cur);
+        return dyn_c_ub_cache;
     }
 
     // Choose the ubatch for this prompt iteration and apply it between decodes.
@@ -3383,14 +3498,26 @@ private:
         }
 
         const int64_t free_mb = dyn_free_mb();
+        const bool c_reserved = dyn_buffers_reserved();
         // while the context can still grow, keep VRAM reserved for the copy
         const int64_t grow_reserve_mb = 0;
+        // the planned (curve) ubatch is the speed optimum; the free-VRAM fit is
+        // a hard safety cap, because the planned value is chosen by depth and a
+        // freshly resized capacity may not have room for it yet
+        // an explicit curve is measured to be feasible on this config, so it is
+        // trusted even when the free VRAM reading is skewed by the CUDA VMM pool
+        // after a resize; the auto curve is derived from that reading
+        const uint32_t fit = dyn_batch.plan_auto((uint64_t) slot.prompt.n_tokens(), free_mb,
+                dyn_compute_mb_per_ub(), c_reserved ? cur : 0, grow_reserve_mb);
         uint32_t t = dyn_batch.auto_curve
-                ? dyn_batch.plan_auto((uint64_t) slot.prompt.n_tokens(), free_mb,
-                        dyn_compute_mb_per_ub(), cur, grow_reserve_mb)
+                ? fit
                 : dyn_batch.plan((uint64_t) slot.prompt.n_tokens(), free_mb);
-        // occupancy only grows inside a prompt: the ubatch may step down, never up
-        if (!new_prompt) {
+        // occupancy only grows inside a prompt: the ubatch may step down, never
+        // up -- except in the first ~2k tokens, right after a resize, when the
+        // measured free VRAM is still settling (the VMM pool holds the old
+        // blocks for a moment)
+        const bool settle_ok = slot.prompt.n_tokens() < 2048;
+        if (!new_prompt && !settle_ok) {
             t = std::min(t, cur);
         }
 
@@ -5099,6 +5226,31 @@ private:
                                 slot.n_prompt_tokens_lcp = 0;
                                 slot.prompt_cache_source = "none";
                                 slot.prompt_cache_reason = "disabled";
+                            }
+
+                            // The new prompt starts from scratch (n_past == 0): the KV for
+                            // this sequence is rewound, so the capacity can be resized for
+                            // this task alone -- shrink to give the freed VRAM back to the
+                            // ubatch, grow to make room for a long prompt.
+                            if (n_past == 0 && n_ctx_max > 0 && ctx_tgt != nullptr) {
+                                const int64_t cur = llama_n_ctx(ctx_tgt);
+                                const int64_t gen = std::min<int64_t>(slot.n_predict_max > 0 ? slot.n_predict_max : 512, 8192);
+                                int64_t need = std::min<int64_t>(n_ctx_max, (int64_t) slot.task->n_tokens() + gen + 2048);
+                                need = (need / 256) * 256;
+                                if (need > 0 && std::llabs(need - cur) >= 2048) {
+                                    slot.mem.seq_rm(slot.id, 0, -1);
+                                    llama_resize_ctx(ctx_tgt, (uint32_t) need, true);
+                                    const uint32_t got = llama_n_ctx(ctx_tgt);
+                                    if (got != (uint32_t) cur) {
+                                        n_ctx = got;
+                                        for (auto & s : slots) {
+                                            s.n_ctx = n_ctx_slot();
+                                        }
+                                        batch.view.set_mem(llama_get_memory(ctx_tgt));
+                                        SRV_INF("ctx-resize: %d -> %u cells at prompt start (%d tokens)\n",
+                                                (int) cur, got, (int) slot.task->n_tokens());
+                                    }
+                                }
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);

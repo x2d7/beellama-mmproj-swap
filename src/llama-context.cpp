@@ -3976,6 +3976,87 @@ bool llama_context::grow_ctx(uint32_t new_ctx) {
     return true;
 }
 
+// Rebuild the KV cache at a smaller capacity. Only valid when no sequence
+// holds cells: the point of shrinking is to trade cache capacity for a larger
+// ubatch after the cached context was invalidated.
+bool llama_context::shrink_ctx(uint32_t new_ctx) {
+    if (new_ctx >= cparams.n_ctx) {
+        return true;
+    }
+    if (cparams.ctx_other != nullptr || model.hparams.vocab_only || !memory) {
+        return false;
+    }
+
+    for (llama_seq_id seq = 0; seq < (llama_seq_id) cparams.n_seq_max; ++seq) {
+        if (llama_memory_seq_pos_max(llama_get_memory(this), seq) >= 0) {
+            LLAMA_LOG_INFO("%s: sequence %d still holds cells, not shrinking\n", __func__, (int) seq);
+            return false;
+        }
+    }
+
+    synchronize();
+    ggml_backend_sched_reset(sched.get());
+    ggml_backend_sched_free_buffers(sched.get());
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
+
+    llama_cparams cparams_new = cparams;
+    new_ctx = GGML_PAD(new_ctx, 256);
+    cparams_new.n_ctx     = cparams.kv_unified ? new_ctx : new_ctx * cparams.n_seq_max;
+    cparams_new.n_ctx_seq = cparams.kv_unified ? new_ctx : GGML_PAD(new_ctx, 256);
+
+    llama_memory_params params_mem = {
+        /*.type_k    =*/ mem_type_k,
+        /*.type_v    =*/ mem_type_v,
+        /*.swa_full  =*/ mem_swa_full,
+        /*.ctx_type  =*/ cparams.ctx_type,
+        /*.kvarn     =*/ cparams.kvarn,
+        /*.kv_tail_tokens =*/ cparams.kv_tail_tokens,
+        /*.kv_tail_tokens_swa =*/ cparams.kv_tail_tokens_swa,
+        /*.kv_tail_tokens_requested =*/ cparams.kv_tail_tokens_requested,
+        /*.kv_tail_tokens_swa_requested =*/ cparams.kv_tail_tokens_swa_requested,
+        /*.kv_tail_native_exact =*/ cparams.kv_tail_native_exact,
+        /*.kv_tail_native_exact_swa =*/ cparams.kv_tail_native_exact_swa,
+        /*.kv_tail_rollback_tokens =*/ cparams.kv_tail_rollback_tokens,
+        /*.kv_tail_type   =*/ cparams.kv_tail_type,
+        /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+    };
+
+    const uint32_t ub_runtime = cparams.n_ubatch;
+    memory.reset();
+    llama_memory_i * mem_new = model.create_memory(params_mem, cparams_new);
+    if (mem_new == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to create memory for %u cells, keeping %u\n",
+                __func__, new_ctx, cparams.n_ctx);
+        llama_memory_i * mem_old = model.create_memory(params_mem, cparams);
+        if (mem_old != nullptr) {
+            memory.reset(mem_old);
+        }
+        return false;
+    }
+    memory.reset(mem_new);
+    cparams = cparams_new;
+    cparams.n_ubatch = ub_runtime;
+    sched_need_reserve = true;
+    LLAMA_LOG_INFO("%s: shrank context to %u cells\n", __func__, (unsigned) cparams_new.n_ctx);
+    return true;
+}
+
+void llama_resize_ctx(struct llama_context * ctx, uint32_t n_ctx, bool allow_shrink) {
+    if (ctx == nullptr) {
+        return;
+    }
+    if (n_ctx > ctx->n_ctx()) {
+        ctx->grow_ctx(n_ctx);
+    } else if (allow_shrink && n_ctx < ctx->n_ctx()) {
+        ctx->shrink_ctx(n_ctx);
+    }
+}
+
 void llama_set_n_ctx(struct llama_context * ctx, uint32_t n_ctx) {
     if (ctx == nullptr) {
         return;

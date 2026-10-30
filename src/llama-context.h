@@ -80,6 +80,7 @@ struct llama_context {
     // grow the context (KV capacity) in place, preserving sequence state.
     // Grow-only; the new size is aligned and the memory modules are rebuilt.
     bool grow_ctx(uint32_t new_n_ctx);
+    bool shrink_ctx(uint32_t new_n_ctx);
 
     // cache parameters captured at construction, needed to rebuild the memory
     ggml_type mem_type_k = GGML_TYPE_F16;

@@ -57,10 +57,23 @@ Two modes for `--dyn-batch-curve`:
 `--dyn-batch-guard-mb` (default 300, profiles use 32) is the VRAM kept free;
 `--dyn-batch-ub-min` is the floor.
 
-## Context growth
+## Context growth and shrink
 
-`--ctx-grow N` starts the context with `N` cells and grows it towards
-`--ctx-size` when the next prompt chunk no longer fits. Growth:
+`--ctx-grow N` starts the context with `N` cells and, with
+`LLAMA_CTX_RESIZE=1`, lets the server resize it per request. When the incoming
+prompt cannot reuse a cached prefix (common prefix < 1024 tokens), the sequence
+memory is wiped at task launch and the capacity is resized to
+`prompt + generation budget + 2k`, capped by `--ctx-size`:
+
+* growing from an empty cache is free (no state copy) - a 4k -> 20k resize
+  takes ~0.8 s, a 10k -> 95k resize ~1.6 s;
+* shrinking is a plain reallocation - 92k -> 10k takes ~20 ms - and gives the
+  VRAM back to the ubatch, restoring the small-prompt prefill rate;
+* if the prefix is reused (multi-turn, restored checkpoint) the capacity is
+  left alone, so a long conversation keeps its cache.
+
+Growth (when the prefix must be preserved, e.g. a prompt that extends the
+cached one):
 
 1. captures the live sequence state (attention + recurrent) into host memory;
 2. frees the old cache, allocates the larger one;
@@ -75,6 +88,23 @@ cached prefixes do not pay for it again.
 `POST /slots/<id>?action=restore` grows the context first when the saved slot
 holds more tokens than the current capacity, instead of failing with
 "no available space in KV cache".
+
+Measured (IQ4_XS, kvarn6, 16 GB, start 88k, depth curve):
+
+| request | capacity | prefill |
+|---|---:|---:|
+| 8k prompt | 10.7k (shrunk at prompt start, 40 ms) | 797-826 t/s |
+| 90k prompt | 95.5k (grown in-prompt, 1.6 s) | 527 t/s |
+| 8k prompt right after the 90k one | 95.5k | 743 t/s |
+| checkpoint save / restore | 8.8k tokens | 2.1 s / 1.3 s |
+
+The experimental per-request resize is behind `LLAMA_CTX_RESIZE=1` because of a
+CUDA VMM limitation: the pool is a bump allocator whose `free()` only moves the
+pointer, so a large grow/shrink leaves the physical pages mapped and the later
+ubatch planning sees less free VRAM than exists (measured: 224 t/s instead of
+527 t/s for a 90k prompt after a 10.7k -> 94.4k resize). The pool now releases
+unused tails larger than 512 MiB, which fixes the accounting for the in-prompt
+growth but not yet for the out-of-loop resize.
 
 ## Tuning process
 

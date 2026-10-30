@@ -731,6 +731,33 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         return ptr;
     }
 
+    // Return the unused tail of the pool to the driver. The pool is a bump
+    // allocator, so everything above pool_used is free by construction; without
+    // this the physical pages stay mapped for the lifetime of the process and a
+    // KV-cache resize can never hand VRAM back to the compute buffers.
+    void trim() {
+        if (pool_addr == 0 || pool_size <= pool_used) {
+            return;
+        }
+        const size_t unused = pool_size - pool_used;
+        if (unused < (512ull << 20)) {
+            return; // keep small tails mapped: they are cheap and reused often
+        }
+#if defined(GGML_USE_HIP)
+        for (auto it = mappings.begin(); it != mappings.end(); ) {
+            if (it->first >= pool_addr + pool_used) {
+                CU_CHECK(cuMemUnmap(it->first, it->second));
+                it = mappings.erase(it);
+            } else {
+                ++it;
+            }
+        }
+#else
+        CU_CHECK(cuMemUnmap(pool_addr + pool_used, unused));
+#endif
+        pool_size = pool_used;
+    }
+
     void free(void * ptr, size_t size) override {
 #ifdef DEBUG_CUDA_MALLOC
         printf("cuda pool[%d]: freed %llu bytes at %llx\n", device, (unsigned long long) size, ptr);
@@ -740,6 +767,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+
+        trim();
     }
 };
 #endif // defined(GGML_USE_VMM)
