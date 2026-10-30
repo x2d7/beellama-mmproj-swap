@@ -3489,6 +3489,9 @@ private:
         if (slot.task && slot.task->tokens.has_mtmd) {
             return; // image chunks must stay inside one ubatch
         }
+        SLT_DBG(slot, "dyn-sync: kv=%d new=%d cur=%u free=%lld\n",
+                (int) slot.prompt.n_tokens(), (int) new_prompt,
+                llama_n_ubatch(ctx_tgt), (long long) dyn_free_mb());
 
         uint32_t cur = llama_n_ubatch(ctx_tgt);
         const int32_t n_kv = slot.prompt.n_tokens();
