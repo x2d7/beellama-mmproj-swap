@@ -2458,6 +2458,8 @@ private:
 
     // Resize the KV capacity to `need` cells, growing or shrinking. The caller
     // must guarantee that the sequence memory is empty (no state to copy).
+    bool ub_hold_after_resize = false;
+
     bool ctx_resize_enabled() const {
         static const bool enabled = [] {
             const char * v = std::getenv("LLAMA_CTX_RESIZE");
@@ -2506,6 +2508,7 @@ private:
         // has settled
         if (dyn_batch.enabled()) {
             llama_set_n_ubatch(ctx_tgt, dyn_batch.ub_min);
+            ub_hold_after_resize = true;
         }
         SRV_INF("ctx-resize: %d -> %u cells (%.0f ms)\n",
                 (int) cur, got, (ggml_time_us() - t0) / 1000.0);
@@ -3530,34 +3533,30 @@ private:
         uint32_t t = dyn_batch.auto_curve
                 ? fit
                 : std::min(dyn_batch.plan((uint64_t) slot.prompt.n_tokens(), free_mb), fit);
-        // a prompt with nothing evaluated yet (including right after a resize) is
-        // a fresh start: the plan may raise the cap, not only lower it
+        // The cap is decided once per prompt and then kept constant: every change
+        // makes the scheduler re-reserve its buffers before the next decode (about
+        // 1 ms per step), and a per-chunk step-down doubles the prefill time. The
+        // capacity is already sized to the request, so the footprint of the first
+        // chunk (compute at this ctx) is the one that matters for the whole prompt.
         const bool fresh = new_prompt || slot.prompt.n_tokens() == 0;
-        // raising the cap inside a running prompt changes the graph ubatch after
-        // the tail arena was sized for it (assert in set_input_kq_mask_tail), so
-        // the cap may only grow at a truly fresh prompt
         if (!fresh) {
+            ub_hold_after_resize = false; // the prompt is running; later ones re-plan
+            return;
+        }
+        if (ub_hold_after_resize) {
+            // raising the cap for the very prompt that triggered a resize hits a
+            // stale KVarN tail arena (assert in set_input_kq_mask_tail_mapped);
+            // keep the minimum for this prompt, the next one re-plans normally
             t = std::min(t, cur);
         }
 
         SRV_INF("dyn-plan: id=%d kv=%d fresh=%d ub=%u cur=%u free=%lld reserved=%d c=%.3f fwd=%d\n",
                 slot.id, (int) slot.prompt.n_tokens(), (int) fresh, t, cur,
                 (long long) free_mb, (int) c_reserved, dyn_compute_mb_per_ub(), (int) n_batch);
-        if (fresh) {
-            if (t != cur) {
-                llama_set_n_ubatch(ctx_tgt, t);
-                cur = llama_n_ubatch(ctx_tgt);
-                SLT_INF(slot, "dyn-batch: fresh prompt, ubatch -> %u (free=%lld MiB)\n", cur, (long long) free_mb);
-            }
-        } else if (dyn_batch.should_apply(cur, t)) {
-            uint32_t next = t;
-            if (dyn_batch.max_drop > 0 && cur > t + dyn_batch.max_drop) {
-                next = cur - dyn_batch.max_drop;
-            }
-            llama_set_n_ubatch(ctx_tgt, next);
+        if (t != cur) {
+            llama_set_n_ubatch(ctx_tgt, t);
             cur = llama_n_ubatch(ctx_tgt);
-            SLT_INF(slot, "dyn-batch: kv=%d free=%lld MiB, ubatch -> %u\n",
-                    slot.prompt.n_tokens(), (long long) free_mb, cur);
+            SLT_INF(slot, "dyn-batch: fresh prompt, ubatch -> %u (free=%lld MiB)\n", cur, (long long) free_mb);
         }
         n_ubatch = (int32_t) cur;
         n_batch   = std::min(n_batch, (int32_t) cur);
