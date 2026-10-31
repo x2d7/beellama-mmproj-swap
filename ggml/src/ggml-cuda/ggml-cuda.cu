@@ -740,12 +740,23 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             return;
         }
         const size_t unused = pool_size - pool_used;
-        if (unused < (512ull << 20)) {
+        if (unused < (64ull << 20)) {
             return; // keep small tails mapped: they are cheap and reused often
+        }
+        // cuMemUnmap needs a range that starts on a whole mapping: align the
+        // trim start up to the allocation granularity, never below pool_used
+        const size_t start_raw = pool_addr + pool_used;
+        const size_t start = (start_raw + granularity - 1) / granularity * granularity;
+        if (start >= pool_addr + pool_size) {
+            return;
+        }
+        const size_t len = pool_addr + pool_size - start;
+        if (len < (64ull << 20)) {
+            return;
         }
 #if defined(GGML_USE_HIP)
         for (auto it = mappings.begin(); it != mappings.end(); ) {
-            if (it->first >= pool_addr + pool_used) {
+            if (it->first >= start) {
                 CU_CHECK(cuMemUnmap(it->first, it->second));
                 it = mappings.erase(it);
             } else {
@@ -753,9 +764,9 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             }
         }
 #else
-        CU_CHECK(cuMemUnmap(pool_addr + pool_used, unused));
+        CU_CHECK(cuMemUnmap(start, len));
 #endif
-        pool_size = pool_used;
+        pool_size = start - pool_addr;
     }
 
     void free(void * ptr, size_t size) override {
@@ -768,7 +779,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
 
-        trim();
+        // note: the tail is NOT unmapped here. Cached CUDA graphs and the
+        // scheduler still hold pointers into physically mapped regions, so
+        // releasing them mid-run causes illegal memory accesses. The pool is
+        // released when the device context is destroyed.
     }
 };
 #endif // defined(GGML_USE_VMM)

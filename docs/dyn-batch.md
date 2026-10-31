@@ -86,7 +86,14 @@ remain:
 * after a shrink, the ubatch planner keeps the small cap in that path (the 8k
   prompt right after a 90k one ran at ~422 t/s instead of ~800);
 * raising the cap immediately after a resize hits an assert in
-  `llama_kv_cache::set_input_kq_mask_tail_mapped` (stale KVarN tail mapping).
+  `llama_kv_cache::set_input_kq_mask_tail_mapped` (stale KVarN tail mapping),
+  and raising it inside a running prompt hits the same assert because the tail
+  arena is sized from the graph ubatch;
+* the CUDA VMM pool cannot be trimmed mid-run either: cached CUDA graphs and
+  the scheduler still hold pointers into the mapped regions, so unmapping the
+  unused tail causes "illegal memory access" in `launch_mul_mat_q`. The pool is
+  released when the device context is destroyed; the ubatch planner therefore
+  sees less free VRAM after a large allocation than is physically unused.
 
 Without the per-request shrink the default configuration is stable: the KV
 capacity is sized once from `--ctx-grow` and grows on demand.

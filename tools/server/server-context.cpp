@@ -3533,15 +3533,17 @@ private:
         // a prompt with nothing evaluated yet (including right after a resize) is
         // a fresh start: the plan may raise the cap, not only lower it
         const bool fresh = new_prompt || slot.prompt.n_tokens() == 0;
-        const bool settle_ok = slot.prompt.n_tokens() < 2048;
-        if (!fresh && !settle_ok) {
+        // raising the cap inside a running prompt changes the graph ubatch after
+        // the tail arena was sized for it (assert in set_input_kq_mask_tail), so
+        // the cap may only grow at a truly fresh prompt
+        if (!fresh) {
             t = std::min(t, cur);
         }
 
+        SRV_INF("dyn-plan: id=%d kv=%d fresh=%d ub=%u cur=%u free=%lld reserved=%d c=%.3f fwd=%d\n",
+                slot.id, (int) slot.prompt.n_tokens(), (int) fresh, t, cur,
+                (long long) free_mb, (int) c_reserved, dyn_compute_mb_per_ub(), (int) n_batch);
         if (fresh) {
-            SRV_INF("dyn-plan: id=%d kv=%d fresh=%d ub=%u cur=%u free=%lld reserved=%d c=%.3f\n",
-                    slot.id, (int) slot.prompt.n_tokens(), (int) fresh, t, cur,
-                    (long long) free_mb, (int) c_reserved, dyn_compute_mb_per_ub());
             if (t != cur) {
                 llama_set_n_ubatch(ctx_tgt, t);
                 cur = llama_n_ubatch(ctx_tgt);
