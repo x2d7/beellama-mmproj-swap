@@ -4009,6 +4009,13 @@ bool llama_context::shrink_ctx(uint32_t new_ctx) {
     cparams_new.n_ctx     = cparams.kv_unified ? new_ctx : new_ctx * cparams.n_seq_max;
     cparams_new.n_ctx_seq = cparams.kv_unified ? new_ctx : GGML_PAD(new_ctx, 256);
 
+    // the KV-tail arena is sized from n_ubatch: build it for the maximum the
+    // context may use, never for the temporarily reduced runtime value, or any
+    // later ubatch raise asserts in set_input_kq_mask_tail_mapped
+    if (n_ubatch_max > 0) {
+        cparams_new.n_ubatch = n_ubatch_max;
+    }
+
     llama_memory_params params_mem = {
         /*.type_k    =*/ mem_type_k,
         /*.type_v    =*/ mem_type_v,

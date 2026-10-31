@@ -2458,12 +2458,10 @@ private:
 
     // Resize the KV capacity to `need` cells, growing or shrinking. The caller
     // must guarantee that the sequence memory is empty (no state to copy).
-    bool ub_hold_after_resize = false;
-
     bool ctx_resize_enabled() const {
         static const bool enabled = [] {
             const char * v = std::getenv("LLAMA_CTX_RESIZE");
-            return v != nullptr && v[0] != '0';
+            return v == nullptr || v[0] != '0';
         }();
         return enabled;
     }
@@ -2508,7 +2506,6 @@ private:
         // has settled
         if (dyn_batch.enabled()) {
             llama_set_n_ubatch(ctx_tgt, dyn_batch.ub_min);
-            ub_hold_after_resize = true;
         }
         SRV_INF("ctx-resize: %d -> %u cells (%.0f ms)\n",
                 (int) cur, got, (ggml_time_us() - t0) / 1000.0);
@@ -3542,14 +3539,7 @@ private:
         // chunk (compute at this ctx) is the one that matters for the whole prompt.
         const bool fresh = new_prompt || slot.prompt.n_tokens() == 0;
         if (!fresh) {
-            ub_hold_after_resize = false; // the prompt is running; later ones re-plan
             return;
-        }
-        if (ub_hold_after_resize) {
-            // raising the cap for the very prompt that triggered a resize hits a
-            // stale KVarN tail arena (assert in set_input_kq_mask_tail_mapped);
-            // keep the minimum for this prompt, the next one re-plans normally
-            t = std::min(t, cur);
         }
 
         SRV_INF("dyn-plan: id=%d kv=%d fresh=%d ub=%u cur=%u free=%lld reserved=%d c=%.3f fwd=%d\n",

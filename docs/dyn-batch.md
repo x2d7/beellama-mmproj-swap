@@ -76,27 +76,36 @@ keeps the ubatch large, while a jump to the maximum starves it.
 holds more tokens than the current capacity, instead of failing with
 "no available space in KV cache".
 
-**Shrinking** is implemented (`llama_resize_ctx(..., allow_shrink)`) and runs at
-prompt start when the request cannot reuse a cached prefix (common prefix <
-1024 tokens): the sequence memory is wiped and the capacity is rebuilt without a
-state copy. Measured 95488 -> 10752 cells in 29-45 ms with free VRAM recovering
-from 39 to 2337 MiB. It is behind `LLAMA_CTX_RESIZE=1` because two problems
-remain:
+**Shrinking** runs at prompt start when the request cannot reuse a cached
+prefix (common prefix < 1024 tokens): the sequence memory is wiped and the
+capacity is rebuilt for that request alone, without a state copy. Measured
+95488 -> 10752 cells in 29-45 ms with free VRAM going from 39 to 2337 MiB. The
+ubatch is then re-planned for the new capacity in the first decode, so the
+speed comes straight back.
 
-* after a shrink, the ubatch planner keeps the small cap in that path (the 8k
-  prompt right after a 90k one ran at ~422 t/s instead of ~800);
-* raising the cap immediately after a resize hits an assert in
-  `llama_kv_cache::set_input_kq_mask_tail_mapped` (stale KVarN tail mapping),
-  and raising it inside a running prompt hits the same assert because the tail
-  arena is sized from the graph ubatch;
-* the CUDA VMM pool cannot be trimmed mid-run either: cached CUDA graphs and
-  the scheduler still hold pointers into the mapped regions, so unmapping the
-  unused tail causes "illegal memory access" in `launch_mul_mat_q`. The pool is
-  released when the device context is destroyed; the ubatch planner therefore
-  sees less free VRAM after a large allocation than is physically unused.
+The KVarN tail arena is the subtle part: the memory modules are sized from
+`n_ubatch`, so a rebuilt cache must be created for `n_ubatch_max`, never for the
+temporarily reduced runtime value. Building it for the current ubatch makes the
+arena too small and any later ubatch raise asserts in
+`set_input_kq_mask_tail_mapped`. `shrink_ctx()` therefore pins
+`cparams_new.n_ubatch = n_ubatch_max` before `create_memory()`.
 
-Without the per-request shrink the default configuration is stable: the KV
-capacity is sized once from `--ctx-grow` and grows on demand.
+Measured end to end (IQ4_XS, kvarn6, 16 GB, ctx 98k, start 88k, curve
+`0:768,65536:700,81920:560,90112:448,98304:384`):
+
+| request | capacity | prefill |
+|---|---:|---:|
+| 8k | 10.7k (shrunk at prompt start, 39 ms) | 686-828 t/s |
+| 90k | 95.5k (grown in-prompt, 1.6 s) | 520 t/s |
+| 8k right after the 90k one | 10.7k (shrunk, 30 ms) | **822 t/s** |
+| multi-turn on that 8k | 10.7k | 821 t/s |
+| checkpoint save / restore | 8.8k tokens | 2.1 s / 1.6 s |
+
+CUDA VMM pool: it is a bump allocator whose `free()` only moves the pointer,
+and unmapping the unused tail mid-run is unsafe (cached CUDA graphs and the
+scheduler keep pointers into the mapped regions -> illegal memory access in
+`launch_mul_mat_q`). The pool is released with the device context; the KV cache
+itself is allocated with `cudaMalloc`, so a resize does return its memory.
 
 ## Tuning process
 

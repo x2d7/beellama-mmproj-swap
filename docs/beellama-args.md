@@ -298,7 +298,7 @@ VRAM. The ubatch cap only moves between `llama_decode()` calls, never inside one
 | `--dyn-batch-step N` | - | `16` | Deadband: the cap changes only when the target moves by at least this much. |
 | `--dyn-batch-max-drop N` | - | `0` | Maximum change per step; `0` = jump straight to the target. |
 | `--ctx-grow N` | `LLAMA_ARG_CTX_GROW` | `0` | Start with `N` KV cells and grow towards `--ctx-size` when a prompt no longer fits. Growth captures the sequence state, rebuilds the cache and restores it (a few seconds at 100k cells). |
-| `LLAMA_CTX_RESIZE=1` | `LLAMA_CTX_RESIZE` | off | Experimental: additionally shrink the capacity at prompt start when the request cannot reuse the cached prefix (94k -> 10.7k in 30-40 ms). Known issues: after a shrink the ubatch planner keeps the small cap in this path, and raising the cap immediately after a resize hits a stale KVarN tail mapping. |
+| `LLAMA_CTX_RESIZE=0` | `LLAMA_CTX_RESIZE` | on | Shrinks the capacity at prompt start when the request cannot reuse the cached prefix (94k -> 10.7k in 30-45 ms, no state copy), then re-plans the ubatch for the new capacity. Set to `0` to keep the capacity grown for the life of the server. |
 
 Depth curves trade VRAM between the KV cache and the ubatch: a large ubatch is
 fast at shallow depth, a large capacity is what makes long prompts possible. A
