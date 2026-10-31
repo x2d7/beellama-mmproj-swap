@@ -83,10 +83,12 @@ capacity is rebuilt for that request alone, without a state copy. Measured
 ubatch is then re-planned for the new capacity in the first decode, so the
 speed comes straight back.
 
-Per-request resize is not available with an owned draft memory (MTP): the draft
-cache keeps its own capacity, so shrinking the target leaves the draft without
-room ("failed to find a memory slot" in the speculative batch). For MTP profiles
-keep `--ctx-grow` equal to `--ctx-size`.
+Per-request resize works with an MTP draft as well, but the draft cache is
+created once and cannot grow later: it is built with the target's *maximum*
+capacity (the larger of the target's current capacity and `--ctx-size`), not
+with the target's starting value, otherwise the draft runs out of slots as soon
+as the target grows past it ("failed to find a memory slot" in the speculative
+batch).
 
 The KVarN tail arena is the subtle part: the memory modules are sized from
 `n_ubatch`, so a rebuilt cache must be created for `n_ubatch_max`, never for the

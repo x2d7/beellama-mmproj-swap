@@ -1730,6 +1730,13 @@ private:
             {
                 common_params params_dft = common_base_params_to_speculative(params_base);
 
+                // the target may start below --ctx-size and grow on demand; the
+                // draft cache is created once, so give it the full capacity or it
+                // runs out of slots when the target grows past its own context
+                if (n_ctx_max > 0) {
+                    params_dft.n_ctx = n_ctx_max;
+                }
+
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;

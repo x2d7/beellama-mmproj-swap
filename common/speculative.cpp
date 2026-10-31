@@ -3058,8 +3058,10 @@ common_speculative_init_result::common_speculative_init_result(
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
 
-    // the draft context holds as many tokens per sequence as the target context
-    cparams.n_ctx = llama_n_ctx(ctx_tgt);
+    // the draft context holds as many tokens per sequence as the target context;
+    // the target may start below its maximum and grow, so give the draft the
+    // larger of the target's current capacity and the configured maximum
+    cparams.n_ctx = std::max<uint32_t>(llama_n_ctx(ctx_tgt), (uint32_t) std::max(0, params_dft.n_ctx));
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
