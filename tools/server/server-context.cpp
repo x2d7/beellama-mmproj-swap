@@ -3486,8 +3486,14 @@ private:
         if (!dyn_batch.enabled() || ctx_tgt == nullptr) {
             return;
         }
+        // only a chunk that actually starts a media segment must stay inside one
+        // ubatch; has_mtmd alone just means "this server has an mmproj", which is
+        // true for every text prompt too
         if (slot.task && slot.task->tokens.has_mtmd) {
-            return; // image chunks must stay inside one ubatch
+            const size_t pos = slot.prompt.n_tokens();
+            if (pos < slot.task->n_tokens() && slot.task->tokens[pos] == LLAMA_TOKEN_NULL) {
+                return;
+            }
         }
 
 
@@ -3516,14 +3522,14 @@ private:
         // the planned (curve) ubatch is the speed optimum; the free-VRAM fit is
         // a hard safety cap, because the planned value is chosen by depth and a
         // freshly resized capacity may not have room for it yet
-        // an explicit curve is measured to be feasible on this config, so it is
-        // trusted even when the free VRAM reading is skewed by the CUDA VMM pool
-        // after a resize; the auto curve is derived from that reading
+        // the curve is the speed optimum, the free-VRAM fit is the hard safety
+        // cap: the curve is chosen by depth, while the capacity (and therefore
+        // the compute buffer) is fixed, so the plan must still fit in VRAM
         const uint32_t fit = dyn_batch.plan_auto((uint64_t) slot.prompt.n_tokens(), free_mb,
                 dyn_compute_mb_per_ub(), c_reserved ? cur : 0, grow_reserve_mb);
         uint32_t t = dyn_batch.auto_curve
                 ? fit
-                : dyn_batch.plan((uint64_t) slot.prompt.n_tokens(), free_mb);
+                : std::min(dyn_batch.plan((uint64_t) slot.prompt.n_tokens(), free_mb), fit);
         // a prompt with nothing evaluated yet (including right after a resize) is
         // a fresh start: the plan may raise the cap, not only lower it
         const bool fresh = new_prompt || slot.prompt.n_tokens() == 0;
