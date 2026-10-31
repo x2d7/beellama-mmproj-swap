@@ -3530,9 +3530,11 @@ private:
         // the compute buffer) is fixed, so the plan must still fit in VRAM
         const uint32_t fit = dyn_batch.plan_auto((uint64_t) slot.prompt.n_tokens(), free_mb,
                 dyn_compute_mb_per_ub(), c_reserved ? cur : 0, grow_reserve_mb);
+        // the explicit curve comes from measurements on this configuration and is
+        // used as-is; the auto curve is derived from the free VRAM reading
         uint32_t t = dyn_batch.auto_curve
                 ? fit
-                : std::min(dyn_batch.plan((uint64_t) slot.prompt.n_tokens(), free_mb), fit);
+                : dyn_batch.plan((uint64_t) slot.prompt.n_tokens(), free_mb);
         // The cap is decided once per prompt and then kept constant: every change
         // makes the scheduler re-reserve its buffers before the next decode (about
         // 1 ms per step), and a per-chunk step-down doubles the prefill time. The
@@ -5253,7 +5255,7 @@ private:
                             // this sequence is rewound, so the capacity can be resized for
                             // this task alone -- shrink to give the freed VRAM back to the
                             // ubatch, grow to make room for a long prompt.
-                            if (n_past == 0 && n_ctx_max > 0 && ctx_tgt != nullptr) {
+                            if (ctx_resize_enabled() && n_past == 0 && n_ctx_max > 0 && ctx_tgt != nullptr) {
                                 const int64_t cur = llama_n_ctx(ctx_tgt);
                                 const int64_t gen = std::min<int64_t>(slot.n_predict_max > 0 ? slot.n_predict_max : 512, 8192);
                                 int64_t need = std::min<int64_t>(n_ctx_max, (int64_t) slot.task->n_tokens() + gen + 2048);
