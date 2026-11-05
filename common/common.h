@@ -741,6 +741,7 @@ struct common_params {
 
     // dynamic KV capacity: start at `ctx_grow` cells and grow towards --ctx-size
     int32_t ctx_grow            = 0;     // 0 = disabled (allocate --ctx-size up front)
+    int32_t ctx_out_reserve     = 32768; // max cells --ctx-grow reserves for a request's generation budget
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 

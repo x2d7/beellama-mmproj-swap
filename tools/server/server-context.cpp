@@ -1343,6 +1343,9 @@ public:
     int64_t dyn_sample_us = 0;   // last progress sample (µs)
     int32_t dyn_sample_kv = 0;   // KV tokens at the last sample
 
+    // upper bound on the generation room --ctx-grow reserves for a request
+    static constexpr int64_t CTX_OUT_RESERVE_MAX = 32768;
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -2399,6 +2402,19 @@ private:
         return n_ctx_max > 0 ? n_ctx_max : slot.n_ctx;
     }
 
+    // Room --ctx-grow must leave for the generated tokens. Sizing the cache to
+    // the prompt alone (plus ~3% headroom) truncates every response that runs
+    // past the grown boundary, which breaks long tool calls and reasoning: the
+    // client's max_tokens is much larger, but the server never allocates the
+    // cells to honour it. Reserve the request's generation budget instead,
+    // clamped so a huge max_tokens (or -1 = generate-until-stop) cannot force
+    // the whole context to be allocated up front and starve the ubatch.
+    int64_t ctx_out_reserve(const server_slot & slot) const {
+        const int64_t cap  = params_base.ctx_out_reserve > 0 ? params_base.ctx_out_reserve : CTX_OUT_RESERVE_MAX;
+        const int64_t want = slot.n_predict_max > 0 ? slot.n_predict_max : cap;
+        return std::min<int64_t>(want, cap);
+    }
+
     // Grow the KV capacity only when the next prompt chunk no longer fits.
     // Earlier chunks are processed with the full ubatch, so the expensive copy
     // and the ubatch step-down happen as late as possible.
@@ -2423,7 +2439,7 @@ private:
             }
         }
         if (kv_empty && n_ctx_max > 0 && ctx_resize_enabled()) {
-            const int64_t gen  = std::min<int64_t>(slot.n_predict_max > 0 ? slot.n_predict_max : 512, 8192);
+            const int64_t gen  = ctx_out_reserve(slot);
             int64_t       need = std::min<int64_t>(n_ctx_max, (int64_t) slot.task->n_tokens() + gen + 2048);
             need = (need / 256) * 256;
             if (need > 0 && need < cur0 && std::llabs(need - cur0) >= 2048) {
@@ -2455,11 +2471,15 @@ private:
         if (next_end + 1 <= cur) {
             return; // the next chunk still fits
         }
-        // Grow to what this prompt actually needs plus ~10% headroom, never
-        // straight to the maximum: a cache sized for the prompt keeps the
-        // ubatch large, while a jump to n_ctx_max starves it (98k with ub 102
-        // instead of 92k with ub 600).
-        int64_t target = std::max<int64_t>(task_n + 2048, (int64_t) (task_n * 1.03));
+        // Grow to what this prompt actually needs plus the generation budget
+        // and a small margin, never straight to the maximum: a cache sized for
+        // the request keeps the ubatch large, while a jump to n_ctx_max starves
+        // it (98k with ub 102 instead of 92k with ub 600). Including the output
+        // budget is what lets a single long response fit: without it the target
+        // only tracks the prompt (~3% headroom) and the response is truncated
+        // at the grown boundary no matter how large max_tokens is.
+        int64_t target = std::max<int64_t>(task_n + ctx_out_reserve(slot) + 2048,
+                                           (int64_t) (task_n * 1.03));
         ctx_grow_to(target);
     }
 
@@ -2734,16 +2754,27 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
-        // A brand-new conversation cannot reuse the cached prefix: wipe the
-        // sequence memory now and resize the capacity for this request alone.
-        // Shrinking is free (no state to copy) and gives the VRAM back to the
-        // ubatch; growing makes room for a long prompt without a later copy.
-        if (ctx_resize_enabled() && n_ctx_max > 0 && ctx_tgt != nullptr && slot.prompt.n_tokens() > 0 &&
-                slot.task->n_tokens() > 0 &&
-                slot.prompt.tokens.get_common_prefix(slot.task->tokens) < 1024) {
-            slot.prompt_clear();
-            const int64_t gen = std::min<int64_t>(slot.n_predict_max > 0 ? slot.n_predict_max : 512, 8192);
-            ctx_resize_to((int64_t) slot.task->n_tokens() + gen + 2048);
+        // Ensure the capacity can hold this request's prompt plus its whole
+        // generation budget.
+        //  - prefix not reusable: wipe the sequence (shrinking is then free) and
+        //    size to prompt + reserve.
+        //  - prefix reusable: keep the cache and grow in place when the remaining
+        //    generation room drops below the reserve. Without this a long
+        //    conversation silently eats the reserved room and every later turn is
+        //    truncated at the fixed capacity (finish_reason: length).
+        if (ctx_resize_enabled() && n_ctx_max > 0 && ctx_tgt != nullptr &&
+                slot.task->n_tokens() > 0) {
+            const bool    reusable = slot.prompt.tokens.get_common_prefix(slot.task->tokens) >= 1024;
+            const int64_t reserve  = ctx_out_reserve(slot);
+            const int64_t ctx_want = (int64_t) slot.task->n_tokens() + reserve + 2048;
+            if (!reusable) {
+                slot.prompt_clear();
+            }
+            if (llama_n_ctx(ctx_tgt) < (int64_t) slot.task->n_tokens() + reserve) {
+                ctx_grow_to(ctx_want);
+            } else if (!reusable) {
+                ctx_resize_to(ctx_want);
+            }
         }
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
@@ -3522,6 +3553,16 @@ private:
             dyn_sample_kv = n_kv;
         }
 
+        // The cap is decided once per prompt and then kept constant: every change
+        // makes the scheduler re-reserve its buffers before the next decode (about
+        // 1 ms per step), and a per-chunk step-down doubles the prefill time. The
+        // capacity is already sized to the request, so the footprint of the first
+        // chunk (compute at this ctx) is the one that matters for the whole prompt.
+        const bool fresh = new_prompt || n_kv == 0;
+        if (!fresh) {
+            return;
+        }
+
         const int64_t free_mb = dyn_free_mb();
         const bool c_reserved = dyn_buffers_reserved();
         // while the context can still grow, keep VRAM reserved for the copy
@@ -3530,27 +3571,23 @@ private:
         // a hard safety cap, because the planned value is chosen by depth and a
         // freshly resized capacity may not have room for it yet
         // the curve is the speed optimum, the free-VRAM fit is the hard safety
-        // cap: the curve is chosen by depth, while the capacity (and therefore
-        // the compute buffer) is fixed, so the plan must still fit in VRAM
-        const uint32_t fit = dyn_batch.plan_auto((uint64_t) slot.prompt.n_tokens(), free_mb,
+        // cap: with --ctx-grow the capacity is already sized to the request, so
+        // plan for the capacity rather than for "nothing evaluated yet"; this
+        // keeps a pre-grown long prompt from being re-planned at kv=0 and
+        // over-riding the ubatch the growth already picked from the curve
+        const uint64_t plan_kv = n_ctx_max > 0
+                ? (uint64_t) llama_n_ctx(ctx_tgt)
+                : (uint64_t) n_kv;
+        const uint32_t fit = dyn_batch.plan_auto(plan_kv, free_mb,
                 dyn_compute_mb_per_ub(), c_reserved ? cur : 0, grow_reserve_mb);
         // the explicit curve comes from measurements on this configuration and is
         // used as-is; the auto curve is derived from the free VRAM reading
         uint32_t t = dyn_batch.auto_curve
                 ? fit
-                : dyn_batch.plan((uint64_t) slot.prompt.n_tokens(), free_mb);
-        // The cap is decided once per prompt and then kept constant: every change
-        // makes the scheduler re-reserve its buffers before the next decode (about
-        // 1 ms per step), and a per-chunk step-down doubles the prefill time. The
-        // capacity is already sized to the request, so the footprint of the first
-        // chunk (compute at this ctx) is the one that matters for the whole prompt.
-        const bool fresh = new_prompt || slot.prompt.n_tokens() == 0;
-        if (!fresh) {
-            return;
-        }
+                : dyn_batch.plan(plan_kv, free_mb);
 
-        SRV_INF("dyn-plan: id=%d kv=%d fresh=%d ub=%u cur=%u free=%lld reserved=%d c=%.3f fwd=%d\n",
-                slot.id, (int) slot.prompt.n_tokens(), (int) fresh, t, cur,
+        SRV_INF("dyn-plan: id=%d kv=%d plan=%d fresh=%d ub=%u cur=%u free=%lld reserved=%d c=%.3f fwd=%d\n",
+                slot.id, (int) n_kv, (int) plan_kv, (int) fresh, t, cur,
                 (long long) free_mb, (int) c_reserved, dyn_compute_mb_per_ub(), (int) n_batch);
         if (t != cur) {
             llama_set_n_ubatch(ctx_tgt, t);
@@ -5254,7 +5291,7 @@ private:
                             // ubatch, grow to make room for a long prompt.
                             if (ctx_resize_enabled() && n_past == 0 && n_ctx_max > 0 && ctx_tgt != nullptr) {
                                 const int64_t cur = llama_n_ctx(ctx_tgt);
-                                const int64_t gen = std::min<int64_t>(slot.n_predict_max > 0 ? slot.n_predict_max : 512, 8192);
+                                const int64_t gen = ctx_out_reserve(slot);
                                 int64_t need = std::min<int64_t>(n_ctx_max, (int64_t) slot.task->n_tokens() + gen + 2048);
                                 need = (need / 256) * 256;
                                 if (need > 0 && need < cur && std::llabs(need - cur) >= 2048) {

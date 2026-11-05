@@ -2015,12 +2015,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--ctx-grow"}, "N",
         string_format("start with N KV cells and grow towards --ctx-size on demand (default: %d = disabled)\n"
-            "growth targets the prompt length plus ~3%% headroom, preserves the cached sequences\n"
+            "growth targets the prompt length plus the request's generation budget (capped), preserving the cached sequences\n"
             "and copies the KV state through host memory (a few seconds at 100k cells)", params.ctx_grow),
         [](common_params & params, int value) {
             params.ctx_grow = std::max(0, value);
         }
     ).set_env("LLAMA_ARG_CTX_GROW").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-out-reserve"}, "N",
+        string_format("upper bound on the generation room --ctx-grow reserves for a request (default: %d cells)\n"
+            "raise it to at least the client's max_tokens so one long response (including reasoning) is not truncated", params.ctx_out_reserve),
+        [](common_params & params, int value) {
+            params.ctx_out_reserve = std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_CTX_OUT_RESERVE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
