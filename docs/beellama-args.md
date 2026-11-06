@@ -297,7 +297,8 @@ VRAM. The ubatch cap only moves between `llama_decode()` calls, never inside one
 | `--dyn-batch-guard-mb N` | - | `300` | Free VRAM kept after the compute buffer. The measured OOM boundary on the 16 GB test card is ~400 MiB (successful deep runs left 425-626 MiB, failures 358-364 MiB). |
 | `--dyn-batch-step N` | - | `16` | Deadband: the cap changes only when the target moves by at least this much. |
 | `--dyn-batch-max-drop N` | - | `0` | Maximum change per step; `0` = jump straight to the target. |
-| `--ctx-grow N` | `LLAMA_ARG_CTX_GROW` | `0` | Start with `N` KV cells and grow towards `--ctx-size` when a prompt no longer fits. Growth captures the sequence state, rebuilds the cache and restores it (a few seconds at 100k cells). |
+| `--ctx-grow N` | `LLAMA_ARG_CTX_GROW` | `0` | Start with `N` KV cells and grow towards `--ctx-size` when a prompt no longer fits. Growth targets the prompt length plus the request's generation budget (`n_predict`, capped by `--ctx-out-reserve`) so long responses are not truncated. Captures the sequence state, rebuilds the cache and restores it (a few seconds at 100k cells). |
+| `--ctx-out-reserve N` | `LLAMA_ARG_CTX_OUT_RESERVE` | `32768` | Upper bound on the generation room `--ctx-grow` reserves for a request. Set it to at least the client's `max_tokens`; otherwise a request whose `max_tokens` exceeds this is truncated at the grown boundary (the client sees `finish_reason: length`). |
 | `LLAMA_CTX_RESIZE=0` | `LLAMA_CTX_RESIZE` | on | Shrinks the capacity at prompt start when the request cannot reuse the cached prefix (94k -> 10.7k in 30-45 ms, no state copy), then re-plans the ubatch for the new capacity. Set to `0` to keep the capacity grown for the life of the server. |
 
 Depth curves trade VRAM between the KV cache and the ubatch: a large ubatch is

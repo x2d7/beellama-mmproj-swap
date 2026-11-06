@@ -69,8 +69,13 @@ lets the server grow it when a prompt no longer fits:
 
 Growth is monotonic for the life of the server and preserves the cached
 sequences, so later turns do not pay for it again. The target is the prompt
-length plus ~3% (never `--ctx-size` straight away): a cache sized for the prompt
-keeps the ubatch large, while a jump to the maximum starves it.
+length plus the request's generation budget (`n_predict`, clamped to 32768
+cells; `-1`/unset reserves the clamp), never `--ctx-size` straight away: a
+cache sized for the request keeps the ubatch large, while a jump to the
+maximum starves it. Reserving the output budget is what lets a single long
+response (a large tool call, a long reasoning trace) fit: sizing to the prompt
+alone left only a few hundred tokens of room and truncated every response at
+the grown boundary regardless of the client's `max_tokens`.
 
 `POST /slots/<id>?action=restore` grows the context first when the saved slot
 holds more tokens than the current capacity, instead of failing with
