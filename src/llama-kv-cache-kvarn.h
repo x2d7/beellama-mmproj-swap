@@ -85,6 +85,11 @@ class llama_kv_cache_kvarn;
 
 class llama_kv_cache_kvarn_context : public llama_kv_cache_context {
 public:
+    // the base class stores the cache pointer only in the constructor that takes a cache,
+    // which this context does not call: every inherited accessor must be delegated to the
+    // wrapped context (relative positions, masks, rotations are properties of the KV cells)
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const override;
+
     llama_kv_cache_kvarn_context(
             llama_kv_cache_kvarn * cache,
             llama_memory_context_ptr base,

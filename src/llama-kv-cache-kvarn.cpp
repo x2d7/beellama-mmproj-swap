@@ -689,6 +689,10 @@ llama_kv_cache_kvarn_context::llama_kv_cache_kvarn_context(
     update_lctx(update_lctx) {
 }
 
+void llama_kv_cache_kvarn_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    base()->set_input_relative_pos(dst, ubatch, extent);
+}
+
 llama_kv_cache_context * llama_kv_cache_kvarn_context::base() const {
     return static_cast<llama_kv_cache_context *>(base_ctx.get());
 }

@@ -4948,7 +4948,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     auto * inp_attn = inp->get_attn();
 
-    // the bias is folded into the mask, where flash attention takes it per head
+    // the bias is folded into the mask, where flash attention takes it per head.
+    // KVarN cannot run on this model: it needs a KV tail, the tail needs the KQ bias as a
+    // separate tensor (this fork's flash attention rejects one), and the hybrid memory it
+    // would have to live in has no KVarN integration at all (llama-memory-hybrid.cpp).
     GGML_ASSERT(inp_attn->mctx->get_base()->get_tail_tokens() == 0 &&
             "the per-head relative-position mask does not support the KV tail");
 
@@ -5502,6 +5505,21 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa(u
                 inp_attn->self_tail_body_read_idxs_swa, inp_attn->self_tail_bias_read_idxs_swa,
                 inp_attn->self_kq_mask_tail_swa, inp_attn->self_tail_query_order_swa,
                 inp_attn->self_tail_run_desc_swa, true);
+    }
+
+    // KVarN rotation tables: the pure-ISWA input builder creates these, the hybrid one
+    // did not, so a hybrid model with `-ctk kvarn*` had no rotation inputs and the
+    // attention build asserted. Same wiring as llm_graph_input_attn_kv_iswa.
+    {
+        const auto * kvarn_base = dynamic_cast<const llama_kv_cache_kvarn_context *>(attn_ctx->get_base());
+        const auto * kvarn_swa  = dynamic_cast<const llama_kv_cache_kvarn_context *>(attn_ctx->get_swa());
+        const auto * kvarn_any  = kvarn_base ? kvarn_base : kvarn_swa;
+        if (kvarn_any != nullptr) {
+            inp_attn->self_kvarn_rot_64  = kvarn_any->build_input_kvarn_rot(ctx0, 64);
+            inp_attn->self_kvarn_rot_128 = kvarn_any->build_input_kvarn_rot(ctx0, 128);
+            inp_attn->self_kvarn_rot_256 = kvarn_any->build_input_kvarn_rot(ctx0, 256);
+            inp_attn->self_kvarn_rot_512 = kvarn_any->build_input_kvarn_rot(ctx0, 512);
+        }
     }
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);

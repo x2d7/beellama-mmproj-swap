@@ -2336,6 +2336,7 @@ struct llama_model_inkling2 : public llama_model_base {
         bool inc_v = false;
         bool inc_g = false;
         int  n_inc = 0;
+        bool packed_ready = false; // set only when post_load_data built the real tensor
     };
     std::vector<qkv_pack> qkv_packs;      // per physical layer, packed == nullptr when not packed
 

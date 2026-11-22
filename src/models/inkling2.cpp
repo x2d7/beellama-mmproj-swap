@@ -297,6 +297,7 @@ void llama_model_inkling2::post_load_data() {
         const int64_t rows = (p.inc_q ? p.wq->ne[1] : 0) + (p.inc_k ? p.wk->ne[1] : 0) +
                              (p.inc_v ? p.wv->ne[1] : 0) + (p.inc_g ? p.wg->ne[1] : 0);
         p.packed = ggml_new_tensor_2d(pack_ctx, p.wk->type, p.wk->ne[0], rows);
+        p.packed_ready = true;
     }
 
     ggml_backend_dev_t dev = dev_layer(0);
@@ -600,7 +601,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             Kcur = zero_kv;
             Vcur = zero_kv;
             gate_proj = zero_q;
-        } else if (pack.packed && pack_fused && pack5_fused && loras->empty() && is_swa && !messages && n_tokens == 1 &&
+        } else if (pack.packed_ready && pack_fused && pack5_fused && loras->empty() && is_swa && !messages && n_tokens == 1 &&
                 inputs[0] == inputs[1]) {
             // one gemv over the packed weights; with a single token each projection is a
             // contiguous slice of the output rows
