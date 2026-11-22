@@ -827,9 +827,13 @@ public:
             const llama_cparams & cparams,
             std::unique_ptr<llm_graph_input_attn_kv_iswa> inp_attn,
             std::unique_ptr<llm_graph_input_rs>          inp_rs,
-            const llama_memory_hybrid_iswa_context *     mctx) :
+            const llama_memory_hybrid_iswa_context *     mctx,
+            uint32_t extent = 0,
+            uint32_t extent_swa = 0) :
         inp_attn(std::move(inp_attn)),
         inp_rs(std::move(inp_rs)),
+        extent(extent),
+        extent_swa(extent_swa),
         cparams(cparams),
         mctx(mctx) { }
     virtual ~llm_graph_input_mem_hybrid_iswa() = default;
@@ -843,6 +847,13 @@ public:
 
     llm_graph_input_attn_kv_iswa * get_attn() const { return inp_attn.get(); }
     llm_graph_input_rs           * get_recr() const { return inp_rs.get(); }
+
+    // distance from the token to the cell, extent for the empty, future and more distant cells
+    ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
+    ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+
+    const uint32_t extent;
+    const uint32_t extent_swa;
 
     const llama_cparams cparams;
 
@@ -1486,9 +1497,24 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kq_mask_override = nullptr) const; // [n_kv, n_tokens/n_stream, n_head, n_stream], replaces the mask
 
     llm_graph_input_attn_k_iswa * build_attn_inp_k_iswa() const;
+
+    // inkling2: the relative-position bias is folded into the mask, where flash attention takes it per head
+    ggml_tensor * build_attn(
+            llm_graph_input_mem_hybrid_iswa * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
+            ggml_tensor * sinks, // [n_head_q]
+                  float   kq_scale,
+                    int   il) const;
 
     // note: if k_cur is not provided, it will not be stored in the memory
     // note: the K cache is used as V (MLA-style attention)
@@ -1552,6 +1578,13 @@ struct llm_graph_context {
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
 
+    void build_conv_state_store(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+            ggml_tensor * conv_x,
+                int64_t   n_cols,
+                 size_t   offs) const;
+
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,
         const llama_ubatch & ubatch,
@@ -1568,7 +1601,7 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
-    llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+    llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa(uint32_t extent = 0, uint32_t extent_swa = 0) const;
 
     //
     // pooling

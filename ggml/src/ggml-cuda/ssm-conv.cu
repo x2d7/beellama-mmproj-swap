@@ -158,9 +158,87 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
     }
 }
 
+
+
+// Fused convolution + state store (see ggml_ssm_conv_store in ggml.c).
+static __global__ void ssm_conv_store_f32(
+        const float * __restrict__ hist,   // [n_conv-1, ch_max, n_seq]
+        const float * __restrict__ w,      // [n_conv, n_ch]
+        const float * __restrict__ cur,    // [n_ch, n_tok, n_seq]
+        float       * __restrict__ dst,    // [n_ch, n_tok, n_seq]
+        float       * __restrict__ state,  // [n_embd_r, n_rs] row-major
+        const int n_conv, const int n_ch, const int n_tok, const int n_seq,
+        const int ch_off,
+        const int hist_stride_c, const int hist_stride_s,
+        const int st_row_stride, const int st_head,
+        const float * __restrict__ add,   // [n_ch, n_tok, n_seq]
+        const float * __restrict__ add2,  // optional second addend, may be null
+        const float scale) {
+    const int c  = blockIdx.x*blockDim.x + threadIdx.x;
+    const int sq = blockIdx.y;
+    if (c >= n_ch || sq >= n_seq) {
+        return;
+    }
+    const int n_hist = n_conv - 1;
+
+    const auto x_at = [&](int pos) -> float {
+        return pos < n_hist
+            ? hist[pos + (ch_off + c)*hist_stride_c + sq*hist_stride_s]
+            : cur[c + (pos - n_hist)*n_ch + sq*n_ch*n_tok];
+    };
+
+    for (int t = 0; t < n_tok; ++t) {
+        float acc = 0.0f;
+        for (int k = 0; k < n_conv; ++k) {
+            acc += x_at(t + k) * w[c*n_conv + k]; // weight is [n_conv, n_ch]: dim0 is the fastest
+        }
+        const size_t o = (size_t) c + (size_t) t*n_ch + (size_t) sq*n_ch*n_tok;
+        // two roundings, exactly like the separate scale and add kernels (no FMA contraction)
+        const float t_out = __fmul_rn(scale, add[o] + acc);
+        dst[o] = add2 ? __fadd_rn(t_out, add2[o]) : t_out;
+    }
+
+    float * cell = state + (size_t) (st_head + sq)*st_row_stride;
+    for (int j = 0; j < n_hist; ++j) {
+        cell[(size_t) (ch_off + c)*n_hist + j] = x_at(n_tok + j);
+    }
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
+
+    if (dst->src[3] != nullptr) {
+        // fused convolution + recurrent state store
+        const int n_conv = ggml_get_op_params_i32(dst, 0);
+        const int ch_off = ggml_get_op_params_i32(dst, 1);
+        const int st_head = ggml_get_op_params_i32(dst, 2);
+        const int st_row_stride = ggml_get_op_params_i32(dst, 3);
+        float scale;
+        memcpy(&scale, (const char *) dst->op_params + 4*sizeof(int32_t), sizeof(float));
+
+        const struct ggml_tensor * cur = dst->src[2];
+        const int n_ch = (int) cur->ne[0];
+        const int n_tok = (int) cur->ne[1];
+        const int n_seq = (int) cur->ne[2];
+
+        const int hist_stride_c = (int) (src0->nb[1]/sizeof(float));
+        const int hist_stride_s = (int) (src0->nb[2]/sizeof(float));
+
+        const dim3 block_dims(256);
+        const dim3 block_nums((n_ch + 255)/256, n_seq);
+        cudaStream_t stream = ctx.stream();
+        ssm_conv_store_f32<<<block_nums, block_dims, 0, stream>>>(
+                (const float *) src0->data, (const float *) src1->data, (const float *) cur->data,
+                (float *) dst->data, (float *) dst->src[3]->data,
+                n_conv, n_ch, n_tok, n_seq, ch_off,
+                hist_stride_c, hist_stride_s, st_row_stride, st_head,
+                (const float *) dst->src[4]->data,
+                dst->src[5] ? (const float *) dst->src[5]->data : nullptr, scale);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     const bool fuse_bias = bias_add_node != nullptr;
     const bool fuse_silu = silu_dst != nullptr;
 

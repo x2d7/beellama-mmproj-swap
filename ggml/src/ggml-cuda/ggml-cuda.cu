@@ -45,7 +45,9 @@
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/pool1d.cuh"
+#include <unistd.h>
 #include "ggml-cuda/quantize.cuh"
+#include "ggml-cuda/q8cache.cuh"
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
@@ -56,6 +58,8 @@
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
+#include "ggml-cuda/clip-l2.cuh"
+#include "ggml-cuda/mix-attn.cuh"
 #include "ggml-cuda/top-k.cuh"
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/tsembd.cuh"
@@ -2654,6 +2658,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SUM_ROWS:
             ggml_cuda_op_sum_rows(ctx, dst);
             break;
+        case GGML_OP_CLIP_L2:
+            ggml_cuda_op_clip_l2(ctx, dst);
+            break;
+        case GGML_OP_MIX_ATTN:
+            ggml_cuda_op_mix_attn(ctx, dst);
+            break;
         case GGML_OP_MEAN:
             ggml_cuda_op_mean(ctx, dst);
             break;
@@ -4898,8 +4908,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            {
+                static bool q8_cache_on = getenv("GGML_CUDA_Q8_CACHE") == nullptr;
+                ggml_cuda_q8_cache_set_evict([](void * ud, void * ptr, size_t size) {
+                    static_cast<ggml_backend_cuda_context *>(ud)->pool().free(ptr, size);
+                }, cuda_ctx);
+                ggml_cuda_q8_cache_reset(q8_cache_on && access("/tmp/opencode/q8c_off", F_OK) != 0);
+            }
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                // a node writing into a cached src1 makes that copy stale
+                ggml_cuda_q8_cache_invalidate(node->data, ggml_nbytes(node));
 #ifdef USE_CUDA_GRAPH
                 // fused nodes are skipped together, so a cut never splits a fusion
                 // a concurrent region must join before its capture can end
@@ -6495,6 +6514,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #else
             return false;
 #endif
+        case GGML_OP_CLIP_L2:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   (op->src[1] == nullptr || op->src[1]->type == GGML_TYPE_F32);
+        case GGML_OP_MIX_ATTN:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:

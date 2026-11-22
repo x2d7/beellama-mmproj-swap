@@ -10,6 +10,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include <mutex>
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -1411,6 +1412,18 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             n_supported++;
                         }
                     }
+                    if (getenv("GGML_SCHED_DUMP_FA") && node->op == GGML_OP_FLASH_ATTN_EXT && b == 0) {
+                        fprintf(stderr, "FA_PASS3 %s: backend %d n_supported=%d\n", node->name, b, n_supported);
+                        for (int j = 0; j < GGML_MAX_SRC; j++) {
+                            struct ggml_tensor * src = node->src[j];
+                            if (src == NULL) continue;
+                            const int sid = tensor_backend_id(src);
+                            fprintf(stderr, "   src%d %-12s buf=%-14s assigned=%d supported=%d\n", j,
+                                    ggml_op_name(src->op),
+                                    src->buffer ? ggml_backend_buffer_name(src->buffer) : "(none)",
+                                    sid, (int) ggml_backend_sched_buffer_supported(sched, src, b));
+                        }
+                    }
                     if (n_supported > n_supported_best) {
                         n_supported_best = n_supported;
                         *node_backend_id = b;
@@ -1662,6 +1675,45 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     if (sched->debug) {
         ggml_backend_sched_print_assignments(sched, graph);
+    }
+
+    if (getenv("GGML_SCHED_DUMP_FA")) {
+        static int n_dumped = 0;
+        if (n_dumped < 2) {
+            n_dumped++;
+            int n_fa = 0, fa_cpu = 0, fa_gpu = 0;
+            for (int i = 0; i < graph->n_nodes; i++) {
+                struct ggml_tensor * node = graph->nodes[i];
+                if (node->op != GGML_OP_FLASH_ATTN_EXT) continue;
+                n_fa++;
+                const int id = tensor_backend_id(node);
+                if (id == sched->n_backends - 1) fa_cpu++; else fa_gpu++;
+                if (n_fa <= 3) {
+                    fprintf(stderr, "FA_FINAL %s backend=%d mask_backend=%d mask_buf=%s k_buf=%s\n",
+                            node->name, id,
+                            tensor_backend_id(node->src[3]),
+                            node->src[3]->buffer ? ggml_backend_buffer_name(node->src[3]->buffer) : "(none)",
+                            node->src[1]->buffer ? ggml_backend_buffer_name(node->src[1]->buffer) : "(none)");
+                }
+            }
+            fprintf(stderr, "FA_TOTAL n=%d cpu=%d gpu=%d\n", n_fa, fa_cpu, fa_gpu);
+        }
+    }
+
+    if (getenv("GGML_SCHED_DUMP_SPLITS")) {
+        static int dumped = 0;
+        if (dumped < 3) {
+            dumped++;
+            fprintf(stderr, "SCHED_SPLITS n=%d\n", sched->n_splits);
+            for (int k = 0; k < sched->n_splits; k++) {
+                const auto & sp = sched->splits[k];
+                const int a = sp.i_start, b = sp.i_end - 1;
+                fprintf(stderr, "  split %3d backend=%d nodes %d..%d  first=%-14s last=%-14s\n", k,
+                        sp.backend_id, a, b,
+                        a >= 0 && a < graph->n_nodes ? ggml_op_name(graph->nodes[a]->op) : "-",
+                        b >= 0 && b < graph->n_nodes ? ggml_op_name(graph->nodes[b]->op) : "-");
+            }
+        }
     }
 
     // pass 6: collect all input tensors into graph_inputs

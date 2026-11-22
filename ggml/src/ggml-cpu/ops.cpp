@@ -1482,6 +1482,122 @@ void ggml_compute_forward_cumsum(
     }
 }
 
+
+
+// attention of n_q queries over the [last block, ..., first block, cur] states, per token
+void ggml_compute_forward_mix_attn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q   = dst->src[0];
+    const ggml_tensor * cur = dst->src[1];
+    const int n_blocks = ggml_get_op_params_i32(dst, 0);
+    float eps;
+    memcpy(&eps, (const char *) dst->op_params + sizeof(int32_t), sizeof(float));
+
+    const int64_t ne0   = q->ne[0];
+    const int64_t n_q   = q->ne[1];
+    const int64_t n_tok = cur->ne[1];
+    const int64_t n_st  = n_blocks + 1;
+    const float scale = 1.0f/sqrtf((float) ne0);
+
+    GGML_ASSERT(ggml_is_contiguous(q) && ggml_is_contiguous(cur) && ggml_is_contiguous(dst));
+
+    const float * qd = (const float *) q->data;
+    const float * xd = (const float *) cur->data;
+    float       * yd = (float       *) dst->data;
+
+    std::vector<float> rms(n_st), score(n_st);
+    for (int64_t t = params->ith; t < n_tok; t += params->nth) {
+        // state s: s < n_blocks -> blocks[n_blocks-1-s] (src[2 + n_blocks-1-s]), s == n_blocks -> cur
+        const float * st_ptr[16];
+        for (int64_t s = 0; s < n_st; ++s) {
+            st_ptr[s] = (s < n_blocks) ? (const float *) dst->src[2 + n_blocks - 1 - s]->data : xd;
+        }
+        for (int64_t s = 0; s < n_st; ++s) {
+            double sum = 0.0;
+            for (int64_t i = 0; i < ne0; ++i) {
+                const float v = st_ptr[s][i + t*ne0];
+                sum += (double) v*v;
+            }
+            rms[s] = sqrtf((float) (sum/ne0) + eps);
+        }
+        for (int64_t j = 0; j < n_q; ++j) {
+            float mx = -INFINITY;
+            for (int64_t s = 0; s < n_st; ++s) {
+                double dot = 0.0;
+                for (int64_t i = 0; i < ne0; ++i) {
+                    dot += (double) st_ptr[s][i + t*ne0] * (double) qd[i + (j*n_tok + t)*ne0];
+                }
+                score[s] = scale*((float) dot / rms[s]);
+                mx = fmaxf(mx, score[s]);
+            }
+            float sum = 0.0f;
+            for (int64_t s = 0; s < n_st; ++s) {
+                score[s] = expf(score[s] - mx);
+                sum += score[s];
+            }
+            for (int64_t s = 0; s < n_st; ++s) {
+                score[s] /= sum;
+            }
+            for (int64_t i = 0; i < ne0; ++i) {
+                float acc = 0.0f;
+                for (int64_t s = 0; s < n_st; ++s) {
+                    acc += (st_ptr[s][i + t*ne0]/rms[s])*score[s];
+                }
+                yd[i + (j*n_tok + t)*ne0] = acc;
+            }
+        }
+    }
+}
+
+// y = x * scale * min(1, threshold / sqrt(sum(x^2) + eps)) over dim 0, contiguous F32
+void ggml_compute_forward_clip_l2(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+    GGML_ASSERT(src1 == nullptr || (src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1)));
+
+    float threshold;
+    memcpy(&threshold, dst->op_params, sizeof(float));
+
+    const int64_t ne0 = src0->ne[0];
+    const int64_t ne1 = src0->ne[1];
+    const int64_t ne2 = src0->ne[2];
+    const int64_t ne3 = src0->ne[3];
+
+    const float * x = (const float *) src0->data;
+    float       * y = (float       *) dst->data;
+    const float * sc = src1 ? (const float *) src1->data : nullptr;
+    const bool sc_per_head = src1 && src1->ne[1] > 1;
+
+    for (int64_t row = params->ith; row < ne1*ne2*ne3; row += params->nth) {
+        const int64_t i1 = row % ne1;
+        const int64_t t  = row / ne1;
+        const int64_t i2 = t % ne2;
+        const int64_t i3 = t / ne2;
+        const int64_t off = ((i3*ne2 + i2)*ne1 + i1)*ne0;
+
+        double sum = 0.0;
+        for (int64_t i = 0; i < ne0; ++i) {
+            sum += (double) x[off + i]*(double) x[off + i];
+        }
+        float f = threshold / (sqrtf((float) sum) + 1e-6f);
+        f = fminf(1.0f, f);
+
+        for (int64_t i = 0; i < ne0; ++i) {
+            float v = x[off + i]*f;
+            if (sc) {
+                v *= sc_per_head ? sc[i1*ne0 + i] : sc[i];
+            }
+            y[off + i] = v;
+        }
+    }
+}
+
 // ggml_compute_forward_sum_rows
 
 static void ggml_compute_forward_sum_rows_f32(
@@ -10372,9 +10488,69 @@ void ggml_compute_forward_flash_attn_back(
 
 // ggml_compute_forward_ssm_conv
 
+static void ggml_compute_forward_ssm_conv_store_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * hist   = dst->src[0]; // [n_conv-1, ch_max, n_seq]
+    const ggml_tensor * weight = dst->src[1]; // [n_conv, ch]
+    const ggml_tensor * cur    = dst->src[2]; // [ch, n_tok, n_seq]
+    ggml_tensor       * state  = dst->src[3]; // [n_embd_r, n_rs]
+
+    const int n_conv = ggml_get_op_params_i32(dst, 0);
+    const int ch_off = ggml_get_op_params_i32(dst, 1);
+    const int st_head = ggml_get_op_params_i32(dst, 2);
+    const int st_row_stride = ggml_get_op_params_i32(dst, 3);
+    float scale;
+    memcpy(&scale, (const char *) dst->op_params + 4*sizeof(int32_t), sizeof(float));
+
+    const float * ad  = (const float *) dst->src[4]->data;
+    const float * ad2 = dst->src[5] ? (const float *) dst->src[5]->data : nullptr;
+
+    const int n_ch  = (int) cur->ne[0];
+    const int n_tok = (int) cur->ne[1];
+    const int n_seq = (int) cur->ne[2];
+    const int n_hist = n_conv - 1;
+
+    const float * hd = (const float *) hist->data;
+    const float * wd = (const float *) weight->data;
+    const float * cd = (const float *) cur->data;
+    float       * yd = (float       *) dst->data;
+    float       * sd = (float       *) state->data;
+
+    const int hist_stride_c = (int) (hist->nb[1]/sizeof(float));
+    const int hist_stride_s = (int) (hist->nb[2]/sizeof(float));
+
+    for (int c = params->ith; c < n_ch; c += params->nth) {
+        for (int sq = 0; sq < n_seq; ++sq) {
+            const auto x_at = [&](int pos) -> float {
+                return pos < n_hist
+                    ? hd[pos + (ch_off + c)*hist_stride_c + sq*hist_stride_s]
+                    : cd[c + (pos - n_hist)*n_ch + sq*n_ch*n_tok];
+            };
+            for (int t = 0; t < n_tok; ++t) {
+                float acc = 0.0f;
+                for (int k = 0; k < n_conv; ++k) {
+                    acc += x_at(t + k)*wd[c*n_conv + k];
+                }
+                const size_t o = (size_t) c + (size_t) t*n_ch + (size_t) sq*n_ch*n_tok;
+                yd[o] = scale*(ad[o] + acc) + (ad2 ? ad2[o] : 0.0f);
+            }
+            float * cell = sd + (size_t) (st_head + sq)*st_row_stride;
+            for (int j = 0; j < n_hist; ++j) {
+                cell[(size_t) (ch_off + c)*n_hist + j] = x_at(n_tok + j);
+            }
+
+        }
+    }
+}
+
 static void ggml_compute_forward_ssm_conv_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    if (dst->src[3] != nullptr) {
+        ggml_compute_forward_ssm_conv_store_f32(params, dst);
+        return;
+    }
     const ggml_tensor * src0 = dst->src[0]; // conv_x
     const ggml_tensor * src1 = dst->src[1]; // conv1d.weight
 

@@ -642,6 +642,11 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // y = x * scale * min(1, threshold / sqrt(sum_i x_i^2 + eps)), sum over dim 0
+        GGML_OP_CLIP_L2,
+        // attention of a single query over the previous block outputs (inkling2 residual mixing)
+        GGML_OP_MIX_ATTN,
+
         GGML_OP_COUNT,
     };
 
@@ -1335,6 +1340,24 @@ extern "C" {
     // A: n columns, r rows,
     // result is n / 2 columns, r rows,
     // expects gate in second half of row, unless swapped is true
+    // Attention over the depth: softmax(q . rms_norm(state) / sqrt(n_embd)) applied back onto the states.
+    // states = [last block, ..., first block, cur]; query is [n_embd, n_q]; result is [n_embd, n_q, n_tokens].
+    GGML_API struct ggml_tensor * ggml_mix_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * const * blocks,
+            int                   n_blocks,
+            struct ggml_tensor  * query,
+            float                 eps);
+
+    // L2 clip used by the looped attention cores: y = x * scale * min(1, threshold/sqrt(sum(x^2)+eps))
+    // scale is optional and broadcast over heads: shape [ne0, ne1]
+    GGML_API struct ggml_tensor * ggml_clip_l2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * scale,
+            float                 threshold);
+
     GGML_API struct ggml_tensor * ggml_glu(
             struct ggml_context * ctx,
              struct ggml_tensor * a,

@@ -2315,6 +2315,148 @@ struct llama_model_falcon_h1 : public llama_model_base {
 };
 
 
+struct llama_model_inkling2 : public llama_model_base {
+    llama_model_inkling2(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+    void post_load_data() override;
+
+    // one packed projection per SWA layer whose q/k/v/gate weights share a quantized type:
+    // a single [n_embd, rows] tensor filled by byte copies of the rows (no requantisation),
+    // so the packed gemv is bit-identical to the separate ones
+    struct qkv_pack {
+        ggml_tensor * wq = nullptr;
+        ggml_tensor * wk = nullptr;
+        ggml_tensor * wv = nullptr;
+        ggml_tensor * wg = nullptr;
+        ggml_tensor * packed = nullptr;
+        // the maximal subset of {q,k,v,gate} whose quantized types agree, in this order
+        bool inc_q = false;
+        bool inc_k = false;
+        bool inc_v = false;
+        bool inc_g = false;
+        int  n_inc = 0;
+    };
+    std::vector<qkv_pack> qkv_packs;      // per physical layer, packed == nullptr when not packed
+
+    // constant per-layer tensors folded to F16 at load: the padded relative-position bias
+    // table, so the graph does not pad and cast it on every token
+    std::vector<ggml_tensor *> rel_bias16; // [n_rel, n_extent + 1] F16, per physical layer
+    ggml_context *        pack_ctx = nullptr;
+    ggml_backend_buffer_t pack_buf = nullptr;
+
+    // the layers stored in the file
+    virtual int n_layer_phys() const { return hparams.n_layer(); }
+
+    // message controllers of the q, k, v and ffn inputs of a looped layer (inkling2_loop)
+    enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
+
+    struct loop_layer {
+        ggml_tensor * msg_query = nullptr;
+        ggml_tensor * ctrl_down[LOOP_CTRL_COUNT]   = {};
+        ggml_tensor * ctrl_gain[LOOP_CTRL_COUNT]   = {};
+        ggml_tensor * ctrl_forget[LOOP_CTRL_COUNT] = {};
+        // ctrl_gain and ctrl_forget stacked: [rank, 2*n_embd], one gemv instead of two
+        ggml_tensor * ctrl_gain_forget[LOOP_CTRL_COUNT] = {};
+    };
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
+        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
+        ggml_tensor * convolve(
+                ggml_tensor * cur,
+                ggml_tensor * weight,
+                ggml_tensor * dynamic,
+                ggml_tensor * state,
+                ggml_tensor * history,
+                llm_graph_input_rs * inp,
+                int64_t offset,
+                ggml_tensor * add2 = nullptr);
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl,
+                ggml_tensor * rms_cur = nullptr);
+
+    protected:
+        // the helpers alone, a derived graph builds its own body
+        struct no_build {};
+        graph(const llama_model & model, const llm_graph_params & params, no_build) : llm_graph_context(params), model(model) { init_arm_flags(); }
+
+        // the inputs and the token embeddings
+        ggml_tensor * build_inputs();
+        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
+        ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
+                ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
+        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+
+        llm_graph_input_mem_hybrid_iswa *    inp  = nullptr;
+        llm_graph_input_attn_kv_iswa *       attn = nullptr;
+        llm_graph_input_rs *                 recr = nullptr;
+
+        const llama_model & model;
+
+        ggml_tensor * inp_out_ids = nullptr;
+        ggml_tensor * tau         = nullptr; // log-scaled positions
+        ggml_tensor * zero_sinks  = nullptr; // all-zero attention sinks, shared by every layer
+        ggml_tensor * zero_q  = nullptr;     // ablation stand-ins for the attention projections
+        ggml_tensor * zero_kv = nullptr;
+        ggml_tensor * zero_o  = nullptr;
+
+        // fusion arms, toggled once per graph build for in-process A/B
+        void init_arm_flags();
+        bool conv_fused  = true;
+        bool clip_fused  = true;
+        bool pack_fused  = true;
+        bool pack5_fused = true;  // partial packing of the remaining SWA layers
+        bool mix_fused   = true;
+        bool relb_fused  = true;
+        bool epi_fused   = true;
+        bool abl_rel     = false; // ablation: drop the rel-pos and sink projections
+        bool abl_moe     = false; // ablation: drop the whole FFN
+        bool abl_ctrl    = false; // ablation: drop the loop controllers
+        bool abl_attn    = false; // ablation: skip flash attention only
+        bool abl_bias    = false; // ablation: zero bias, keep flash attention
+        bool rbf_fused   = true;  // fused relative-position bias kernel
+        bool abl_conv    = false; // ablation: drop the short convolutions
+        bool abl_mix     = false; // ablation: drop the single-query mixes
+        bool abl_aproj    = false; // ablation: drop the attention projection gemvs
+        bool add2_fused  = true;  // fold the FFN residual into the conv epilogue
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+// the cache slots after the physical layers repeat the core [core_start, core_end) for each later pass
+struct llama_model_inkling2_loop : public llama_model_inkling2 {
+    llama_model_inkling2_loop(const struct llama_model_params & params) : llama_model_inkling2(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+    void reload_arch_tensor_layout(llama_model_loader & ml) override;
+    void post_load_data() override;
+
+    // buffer for the stacked controller matrices
+    ggml_context *        ctrl_ctx = nullptr;
+    ggml_backend_buffer_t ctrl_buf = nullptr;
+
+    int n_layer_phys() const override { return n_phys; }
+    int layer_phys(int il) const;
+
+    int      n_phys     = 0;
+    uint32_t core_start = 0;
+    uint32_t core_end   = 0;
+    uint32_t n_passes   = 0;
+    uint32_t gate_rank  = 0;
+    bool     varying    = false; // trained for a varying number of passes
+
+    // indexed by physical layer - core_start
+    std::vector<loop_layer> loop_layers;
+
+    struct graph : public llama_model_inkling2::graph {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 struct llama_model_lfm2 : public llama_model_base {
     llama_model_lfm2(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

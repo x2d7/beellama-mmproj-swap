@@ -206,7 +206,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
     //     are put into the template specialization without GQA optimizations.
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // a mask with a head dimension is not shared by the Q heads of a K/V head
+    bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -774,7 +775,7 @@ static constexpr int GGML_CUDA_FATTN_OP_PARAM_FORCE_VEC = 7;
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
-    return BEST_FATTN_KERNEL_NONE;
+    { if (getenv("GGML_FA_DEBUG")) fprintf(stderr, "FA_NONE line %d mask_ne2=%lld n_kv=%lld n_head=%lld\n", __LINE__, (long long)(dst->src[3]?dst->src[3]->ne[2]:-1), (long long)dst->src[1]->ne[1], (long long)dst->src[0]->ne[2]); return BEST_FATTN_KERNEL_NONE; }
 #endif// FLASH_ATTN_AVAILABLE
 
     const ggml_tensor * KQV   = dst;
@@ -791,7 +792,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && mask->ne[2] == 1 && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -816,51 +817,58 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case 112:
         case 256:
             if (V->ne[0] != K->ne[0]) {
-                return BEST_FATTN_KERNEL_NONE;
+                { if (getenv("GGML_FA_DEBUG")) fprintf(stderr, "FA_NONE line %d mask_ne2=%lld n_kv=%lld n_head=%lld\n", __LINE__, (long long)(dst->src[3]?dst->src[3]->ne[2]:-1), (long long)dst->src[1]->ne[1], (long long)dst->src[0]->ne[2]); return BEST_FATTN_KERNEL_NONE; }
             }
             break;
         case 192:
             if (V->ne[0] != 128 || !gqa_opt_applies) {
-                return BEST_FATTN_KERNEL_NONE;
+                { if (getenv("GGML_FA_DEBUG")) fprintf(stderr, "FA_NONE line %d mask_ne2=%lld n_kv=%lld n_head=%lld\n", __LINE__, (long long)(dst->src[3]?dst->src[3]->ne[2]:-1), (long long)dst->src[1]->ne[1], (long long)dst->src[0]->ne[2]); return BEST_FATTN_KERNEL_NONE; }
             }
             if (gqa_ratio % 8 != 0) {
-                return BEST_FATTN_KERNEL_NONE;
+                { if (getenv("GGML_FA_DEBUG")) fprintf(stderr, "FA_NONE line %d mask_ne2=%lld n_kv=%lld n_head=%lld\n", __LINE__, (long long)(dst->src[3]?dst->src[3]->ne[2]:-1), (long long)dst->src[1]->ne[1], (long long)dst->src[0]->ne[2]); return BEST_FATTN_KERNEL_NONE; }
             }
             break;
         case 320:
             if (V->ne[0] != 256 || !gqa_opt_applies) {
-                return BEST_FATTN_KERNEL_NONE;
+                { if (getenv("GGML_FA_DEBUG")) fprintf(stderr, "FA_NONE line %d mask_ne2=%lld n_kv=%lld n_head=%lld\n", __LINE__, (long long)(dst->src[3]?dst->src[3]->ne[2]:-1), (long long)dst->src[1]->ne[1], (long long)dst->src[0]->ne[2]); return BEST_FATTN_KERNEL_NONE; }
             }
             if (gqa_ratio % 32 != 0) {
-                return BEST_FATTN_KERNEL_NONE;
+                { if (getenv("GGML_FA_DEBUG")) fprintf(stderr, "FA_NONE line %d mask_ne2=%lld n_kv=%lld n_head=%lld\n", __LINE__, (long long)(dst->src[3]?dst->src[3]->ne[2]:-1), (long long)dst->src[1]->ne[1], (long long)dst->src[0]->ne[2]); return BEST_FATTN_KERNEL_NONE; }
             }
             break;
         case 512:
             if (V->ne[0] != K->ne[0]) {
-                return BEST_FATTN_KERNEL_NONE;
+                { if (getenv("GGML_FA_DEBUG")) fprintf(stderr, "FA_NONE line %d mask_ne2=%lld n_kv=%lld n_head=%lld\n", __LINE__, (long long)(dst->src[3]?dst->src[3]->ne[2]:-1), (long long)dst->src[1]->ne[1], (long long)dst->src[0]->ne[2]); return BEST_FATTN_KERNEL_NONE; }
             }
             if (!gqa_opt_applies) {
-                return BEST_FATTN_KERNEL_NONE;
+                { if (getenv("GGML_FA_DEBUG")) fprintf(stderr, "FA_NONE line %d mask_ne2=%lld n_kv=%lld n_head=%lld\n", __LINE__, (long long)(dst->src[3]?dst->src[3]->ne[2]:-1), (long long)dst->src[1]->ne[1], (long long)dst->src[0]->ne[2]); return BEST_FATTN_KERNEL_NONE; }
             }
             break;
         case 576:
             if (V->ne[0] != 512) {
-                return BEST_FATTN_KERNEL_NONE;
+                { if (getenv("GGML_FA_DEBUG")) fprintf(stderr, "FA_NONE line %d mask_ne2=%lld n_kv=%lld n_head=%lld\n", __LINE__, (long long)(dst->src[3]?dst->src[3]->ne[2]:-1), (long long)dst->src[1]->ne[1], (long long)dst->src[0]->ne[2]); return BEST_FATTN_KERNEL_NONE; }
             }
             if (!gqa_opt_applies) {
-                return BEST_FATTN_KERNEL_NONE;
+                { if (getenv("GGML_FA_DEBUG")) fprintf(stderr, "FA_NONE line %d mask_ne2=%lld n_kv=%lld n_head=%lld\n", __LINE__, (long long)(dst->src[3]?dst->src[3]->ne[2]:-1), (long long)dst->src[1]->ne[1], (long long)dst->src[0]->ne[2]); return BEST_FATTN_KERNEL_NONE; }
             }
             break;
         default:
-            return BEST_FATTN_KERNEL_NONE;
+            { if (getenv("GGML_FA_DEBUG")) fprintf(stderr, "FA_NONE line %d mask_ne2=%lld n_kv=%lld n_head=%lld\n", __LINE__, (long long)(dst->src[3]?dst->src[3]->ne[2]:-1), (long long)dst->src[1]->ne[1], (long long)dst->src[0]->ne[2]); return BEST_FATTN_KERNEL_NONE; }
     }
 
     if (!ggml_cuda_fattn_kv_type_supported(K->type) || !ggml_cuda_fattn_kv_type_supported(V->type)) {
-        return BEST_FATTN_KERNEL_NONE;
+        { if (getenv("GGML_FA_DEBUG")) fprintf(stderr, "FA_NONE line %d mask_ne2=%lld n_kv=%lld n_head=%lld\n", __LINE__, (long long)(dst->src[3]?dst->src[3]->ne[2]:-1), (long long)dst->src[1]->ne[1], (long long)dst->src[0]->ne[2]); return BEST_FATTN_KERNEL_NONE; }
     }
 
-    if (mask && mask->ne[2] != 1) {
-        return BEST_FATTN_KERNEL_NONE;
+    // experiment: force a specific kernel at decode (0 = off, 200 = tile, 400 = mma_f16)
+    {
+        static const int forced = [] { const char * e = getenv("GGML_FA_FORCE_KERNEL"); return e ? atoi(e) : 0; }();
+        if (forced == BEST_FATTN_KERNEL_TILE) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
+        if (forced == BEST_FATTN_KERNEL_MMA_F16) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:

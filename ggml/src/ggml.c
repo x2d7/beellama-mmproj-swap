@@ -1176,9 +1176,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "CLIP_L2",
+    "MIX_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1296,9 +1299,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "clip_l2(x)",
+    "mix_attn(x)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3078,6 +3084,148 @@ struct ggml_tensor * ggml_trunc_inplace(
         struct ggml_context * ctx,
         struct ggml_tensor  * a) {
     return ggml_unary_inplace(ctx, a, GGML_UNARY_OP_TRUNC);
+}
+
+
+
+
+// Fused short convolution + recurrent state store (inkling2):
+//   dst[c, t, sq] = sum_k w[k, c] * x[t + k, c, sq],  x = concat(history, cur)
+//   state[head + sq][ (ch_off + c)*(n_conv-1) + j ] = x[n_tok + j, c, sq]
+// Declared by the caller (llama-graph.cpp); kept out of ggml.h on purpose.
+
+GGML_API struct ggml_tensor * ggml_ssm_conv_store(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * history, // [n_conv-1, channels, n_seqs]
+        struct ggml_tensor  * weight,  // [n_conv, channels]
+        struct ggml_tensor  * cur,     // [channels, n_tok, n_seqs]
+        struct ggml_tensor  * state,   // [n_embd_r, n_rs]
+        int64_t               n_conv,
+        int64_t               ch_off,
+        int64_t               st_head,
+        float                 scale,
+        struct ggml_tensor  * add2) {
+    GGML_ASSERT(history->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && state->type == GGML_TYPE_F32);
+    GGML_ASSERT(history->ne[0] == n_conv - 1);
+    GGML_ASSERT(weight->ne[0] == n_conv);
+    GGML_ASSERT(weight->ne[1] == cur->ne[0]);
+    GGML_ASSERT(history->ne[2] == cur->ne[2]);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cur->ne[0], cur->ne[1], cur->ne[2]);
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = history;
+    result->src[1] = weight;
+    result->src[2] = cur;
+    result->src[3] = state;
+    result->src[4] = cur;  // "add" operand: dst = scale*(cur + conv) + add2
+    result->src[5] = add2; // optional second addend (the FFN residual)
+    ggml_set_op_params_i32(result, 0, (int32_t) n_conv);
+    ggml_set_op_params_i32(result, 1, (int32_t) ch_off);
+    ggml_set_op_params_i32(result, 2, (int32_t) st_head);
+    ggml_set_op_params_i32(result, 3, (int32_t) (state->nb[1]/sizeof(float)));
+    memcpy((char *) result->op_params + 4*sizeof(int32_t), &scale, sizeof(float));
+    return result;
+}
+
+
+
+// Fused gated residual of the inkling2 loop controller. Declared by the caller, not in ggml.h.
+// Shares GGML_OP_MIX_ATTN, marked by n_blocks == -1.
+
+GGML_API struct ggml_tensor * ggml_gated_residual(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * message,
+        struct ggml_tensor  * gain,
+        struct ggml_tensor  * forget) {
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && message->type == GGML_TYPE_F32);
+    GGML_ASSERT(gain->type == GGML_TYPE_F32 && forget->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(cur, message) && ggml_are_same_shape(cur, gain) && ggml_are_same_shape(cur, forget));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cur->ne[0], cur->ne[1]);
+    result->op     = GGML_OP_MIX_ATTN;
+    result->src[0] = cur;
+    result->src[1] = message;
+    result->src[2] = gain;
+    result->src[3] = forget;
+    ggml_set_op_params_i32(result, 0, -1);
+    ggml_set_op_params_f32(result, 1, 0.0f);
+    return result;
+}
+
+// Fused relative-position bias of the inkling2 attention (see mix-attn.cu). Declared by the
+// caller, not in ggml.h. Shares GGML_OP_MIX_ATTN, marked by n_blocks == -2.
+GGML_API struct ggml_tensor * ggml_rel_bias_fused(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * rcur,     // [n_rel, n_head, nt] F32
+        struct ggml_tensor  * sink,     // [n_head, nt] F32
+        struct ggml_tensor  * bias,     // [n_rel, n_ext+1] F16
+        struct ggml_tensor  * rel_pos) { // [n_kv, nt] I32
+    GGML_ASSERT(rcur->type == GGML_TYPE_F32 && sink->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias->type == GGML_TYPE_F16 && rel_pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(rcur->ne[0] == bias->ne[0]);
+    GGML_ASSERT(rel_pos->ne[1] == sink->ne[1]); // same n_tokens; rel_pos ne0 is n_kv
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rcur->ne[1], rel_pos->ne[0], rcur->ne[2]);
+    result->op     = GGML_OP_MIX_ATTN;
+    result->src[0] = rcur;
+    result->src[1] = sink;
+    result->src[2] = bias;
+    result->src[3] = rel_pos;
+    ggml_set_op_params_i32(result, 0, -2);
+    ggml_set_op_params_f32(result, 1, 0.0f);
+    return result;
+}
+
+struct ggml_tensor * ggml_mix_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * const * blocks,
+        int                   n_blocks,
+        struct ggml_tensor  * query,
+        float                 eps) {
+    GGML_ASSERT(cur->type   == GGML_TYPE_F32);
+    GGML_ASSERT(query->type == GGML_TYPE_F32);
+    GGML_ASSERT(cur->ne[0]  == query->ne[0]);
+    GGML_ASSERT(n_blocks >= 0 && n_blocks <= GGML_MAX_SRC - 2);
+    for (int i = 0; i < n_blocks; ++i) {
+        GGML_ASSERT(blocks[i]->type == GGML_TYPE_F32);
+        GGML_ASSERT(blocks[i]->ne[0] == cur->ne[0] && blocks[i]->ne[1] == cur->ne[1]);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cur->ne[0], query->ne[1], cur->ne[1]);
+    result->op     = GGML_OP_MIX_ATTN;
+    result->src[0] = query;
+    result->src[1] = cur;
+    for (int i = 0; i < n_blocks; ++i) {
+        result->src[2 + i] = blocks[i];
+    }
+    ggml_set_op_params_i32(result, 0, n_blocks);
+    ggml_set_op_params_f32(result, 1, eps);
+    return result;
+}
+
+struct ggml_tensor * ggml_clip_l2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * scale,
+        float                 threshold) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    if (scale != NULL) {
+        GGML_ASSERT(scale->type == GGML_TYPE_F32);
+        GGML_ASSERT(scale->ne[0] == a->ne[0]);
+        GGML_ASSERT(scale->ne[1] == a->ne[1] || scale->ne[1] == 1);
+        GGML_ASSERT(scale->ne[2] == 1 && scale->ne[3] == 1);
+    }
+    GGML_ASSERT(threshold > 0.0f);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    result->op     = GGML_OP_CLIP_L2;
+    result->src[0] = a;
+    result->src[1] = scale;
+    ggml_set_op_params_f32(result, 0, threshold);
+    return result;
 }
 
 struct ggml_tensor * ggml_glu(

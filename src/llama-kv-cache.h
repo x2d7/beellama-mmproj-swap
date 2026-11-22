@@ -376,6 +376,7 @@ public:
             ggml_tensor * query_order, ggml_tensor * run_desc,
             ggml_tensor * body_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -742,6 +743,7 @@ public:
             ggml_tensor * query_order, ggml_tensor * run_desc,
             ggml_tensor * body_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     virtual void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    virtual void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
     virtual void set_input_k_rot(ggml_tensor * dst) const;
     virtual void set_input_v_rot(ggml_tensor * dst) const;

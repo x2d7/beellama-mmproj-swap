@@ -8,6 +8,29 @@
 > - **Dynamic batch for prefill** (`--dyn-batch-curve`, `--dyn-batch-guard-mb`, `--dyn-batch-step`, `--dyn-batch-max-drop`, `--dyn-batch-ub-min`) — two-tier batching: the free logical-batch tier adjusts, and `llama_set_n_ubatch()` shrinks the physical ubatch only when VRAM demands it, between decodes and never inside one. Works with an automatic free-VRAM curve or an explicit `kv:ub` plan per depth.
 > - **Context growth** (`--ctx-grow`) — start with a smaller KV cache and grow it towards `--ctx-size` on demand, preserving the cached sequences and re-sizing the ubatch afterwards, so VRAM is traded between cache depth and prefill speed. Slot restore grows first when the checkpoint holds more tokens than the current capacity. The capacity also shrinks back to the request size at prompt start when the cached prefix cannot be reused (30-45 ms, no state copy), so a short prompt after a long one gets its full prefill speed back (`LLAMA_CTX_RESIZE=0` disables this).
 
+## Measured speeds (RTX 5060 Ti 16 GB, this branch)
+
+Inkling-2-Mini (26B MoE, UD-Q3_K_XL, 12.68 GiB), `-ngl 99 -c 8192 -ctk q8_0 -ctv q8_0 --flash-attn on`,
+greedy, median of 6 runs. Driver 580.173.02, commit `ea715c633` + the inference changes below.
+
+| metric | before this work | now | notes |
+|---|---:|---:|---|
+| decode | 19.28 ms/token (51.8 tok/s) | **15.79-15.82 ms/token (63.2-63.3 tok/s)** | ctx 8 k, kv q8_0, ub 256, median of 6 x 256 greedy |
+| prefill, 4 k-token prompt | 494 tok/s (ub 64) | **~700 tok/s (ub 256)** | +42 %; ub 128 = 562; ub 1024 = ~700 but needs 15.3 GB of 16 GB |
+| prefill, 8 k-token prompt | 491 tok/s | **530-565 tok/s (ub 256)** | +8-15 %; the gain shrinks with length because attention grows |
+| TTFT, 35-token prompt | 42.6 ms cold / 5.0 ms warm | 5.0 ms warm | first request after load pays the graph build |
+| long-context retrieval | - | found at 2.4 k, 4.8 k, 8.0 k (needle first and middle) | 3 of 3 positions |
+| greedy output equivalence | - | bit-identical to the unfused build | 256-token story, 1051/1051 chars |
+
+Decode breakdown (node-level nsys, per token): FFN 5.31 ms (365 GB/s, at the measured
+cold-read ceiling of 363 GB/s), attention projections 3.61 ms (351 GB/s), the rest is
+latency-bound small kernels and dependency stalls.
+
+What got the decode gain: fused short convolution + state store, fused CLIP_L2, packed
+k/v/gate projections, fused block-mix kernel, F16 bias-table folding, fused gated residual,
+2 rows per GEMV block, fused relative-position bias, residual joins folded into the conv
+epilogue, and a q8_1 cache (19.28 -> 15.79 ms, +22 %).
+
 ![BeeLlama.cpp logo](beellama.jpg)
 
 BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing more speed and context out of local GGUF inference. It adds variance-normalized KV-cache quantization (KVarN), KV cache precision tail for recent tokens, low-bit cache types, adaptive draft control for speculative decoding, reasoning-loop protection, and more.

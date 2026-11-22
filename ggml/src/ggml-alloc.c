@@ -955,6 +955,29 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
     }
+    if (getenv("GGML_ALLOCR_DUMP_TOP")) {
+        struct { const char * name; const char * op; int64_t ne[4]; size_t sz; } top[10];
+        int ntop = 0;
+        for (int i = 0; i < graph->n_nodes + graph->n_leafs; i++) {
+            struct ggml_tensor * t = i < graph->n_nodes ? graph->nodes[i] : graph->leafs[i - graph->n_nodes];
+            if (!t || t->view_src) continue;
+            size_t sz = ggml_nbytes(t);
+            if (ntop < 10 || sz > top[9].sz) {
+                if (ntop < 10) ntop++;
+                int k = ntop - 1;
+                while (k > 0 && top[k-1].sz < sz) { top[k] = top[k-1]; k--; }
+                top[k].name = t->name; top[k].op = ggml_op_name(t->op); top[k].sz = sz;
+                for (int d = 0; d < 4; d++) top[k].ne[d] = t->ne[d];
+            }
+        }
+        fprintf(stderr, "ALLOCR_TOP buft=%s:\n", galloc->bufts[0]->iface.get_name ? galloc->bufts[0]->iface.get_name(galloc->bufts[0]) : "?");
+        for (int k = 0; k < ntop; k++) {
+            fprintf(stderr, "  %8.1f MiB %-14s %-22s ne=[%lld,%lld,%lld,%lld]\n",
+                    top[k].sz/1048576.0, top[k].op, top[k].name,
+                    (long long)top[k].ne[0], (long long)top[k].ne[1], (long long)top[k].ne[2], (long long)top[k].ne[3]);
+        }
+    }
+
     if (galloc->n_leafs < graph->n_leafs) {
         free(galloc->leaf_allocs);
         galloc->leaf_allocs = calloc(graph->n_leafs, sizeof(galloc->leaf_allocs[0]));

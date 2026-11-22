@@ -1684,6 +1684,13 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     inp_attn->mctx = mctx->get_attn();
     inp_attn->set_input(ubatch);
 
+    if (self_rel_pos && self_rel_pos->buffer) {
+        mctx->get_attn()->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
+    }
+    if (self_rel_pos_swa && self_rel_pos_swa->buffer) {
+        mctx->get_attn()->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+    }
+
     inp_rs->set_history();
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -1759,6 +1766,15 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
     res &= reuse_tail(attn_ctx->get_base(), false);
     res &= reuse_tail(attn_ctx->get_swa(), true);
+
+    if (self_rel_pos) {
+        res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
+        res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
+    }
+    if (self_rel_pos_swa) {
+        res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+        res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2204,12 +2220,18 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     return res;
 }
 
+// ablation switches of the inkling2 experiments (set from the model's graph)
+bool g_inkling_abl_norm = false;
+
 ggml_tensor * llm_graph_context::build_norm(
          ggml_tensor * cur,
          ggml_tensor * mw,
          ggml_tensor * mb,
        llm_norm_type   type,
                  int   il) const {
+    if (g_inkling_abl_norm) {
+        return cur;
+    }
     switch (type) {
         case LLM_NORM:       cur = ggml_norm    (ctx0, cur, hparams.f_norm_eps);     break;
         case LLM_NORM_RMS:   cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps); break;
@@ -2671,7 +2693,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
-        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS || hparams.expert_router_f32) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
         }
         cb(logits, "ffn_moe_logits", il);
@@ -2786,7 +2808,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
         // Avoid division by zero, clamp to smallest number representable by F16
-        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        if (hparams.expert_weights_norm_eps > 0.0f) {
+            weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, hparams.expert_weights_norm_eps);
+        } else {
+            weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        }
         cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
 
         weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
@@ -2906,6 +2932,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 GGML_ASSERT(has_gate);
                 const float beta = hparams.situ_beta;
                 const float lb   = hparams.situ_linear_beta;
+
+                // ggml_scale does not take strided input, and the merged gate_up path views it
+                if (!ggml_is_contiguous(cur)) {
+                    cur = ggml_cont(ctx0, cur);
+                }
+                if (lb > 0.0f && !ggml_is_contiguous(up)) {
+                    up = ggml_cont(ctx0, up);
+                }
 
                 ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
                 act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
@@ -4174,7 +4208,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool gather_k_tail = k_tail != nullptr;
     const bool gather_v_tail = v_tail != nullptr;
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs();
-    llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
+    llama_kv_tail_route tail_route = kq_mask_override ? LLAMA_KV_TAIL_ROUTE_NONE : mctx_cur->get_tail_route(il);
     // A backend query-width fallback still requires the generic tail oracle.
     // Non-causal DFlash and D64 are different: only record-consuming attention
     // is unqualified. Their materialized F16 body can retain the advertised
@@ -4526,7 +4560,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * kq_mask_override) const {
     const bool is_swa = hparams.is_swa(il);
 
     auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
@@ -4539,7 +4574,8 @@ ggml_tensor * llm_graph_context::build_attn(
     // Q still has all streams flattened here; build_attn_mha divides its
     // token dimension by the mask's stream count. Route by that per-stream
     // query width, not the batch's total token count (e.g. 30 one-row decodes).
-    const auto * route_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
+    const auto * route_mask = kq_mask_override ? kq_mask_override :
+        (is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask());
     GGML_ASSERT(route_mask->ne[3] > 0 && q_cur->ne[2] % route_mask->ne[3] == 0);
     const uint32_t query_tokens_per_stream = uint32_t(q_cur->ne[2] / route_mask->ne[3]);
     const bool kvarn_native_attention = llm_kvarn_native_attention_for(
@@ -4655,7 +4691,8 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
-    const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
+    ggml_tensor * kq_mask = kq_mask_override ? kq_mask_override :
+        (is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask());
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = use_kv_cur ? k_cur : use_kvarn ?
@@ -4893,6 +4930,45 @@ llm_graph_input_attn_cross * llm_graph_context::build_attn_inp_cross() const {
     inp->cross_kq_mask_cnv = inp->cross_kq_mask;
 
     return (llm_graph_input_attn_cross *) res->add_input(std::move(inp));
+}
+
+ggml_tensor * llm_graph_context::build_attn(
+        llm_graph_input_mem_hybrid_iswa * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * kq_b,
+        ggml_tensor * sinks,
+            float     kq_scale,
+            int       il) const {
+    const bool is_swa = hparams.is_swa(il);
+
+    auto * inp_attn = inp->get_attn();
+
+    // the bias is folded into the mask, where flash attention takes it per head
+    GGML_ASSERT(inp_attn->mctx->get_base()->get_tail_tokens() == 0 &&
+            "the per-head relative-position mask does not support the KV tail");
+
+    ggml_tensor * kq_mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
+    if (kq_mask->type != GGML_TYPE_F32) {
+        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+    }
+    if (cparams.flash_attn) {
+        // the bias is cast, not copied: the long-context compute buffer is n_kv x n_head x n_tokens per layer
+        if (kq_b->type != GGML_TYPE_F16) {
+            kq_b = ggml_cast(ctx0, kq_b, GGML_TYPE_F16);
+        }
+        if (kq_mask->type != GGML_TYPE_F16) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+        }
+    }
+    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
+    cb(kq_mask, "kq_mask_rel_pos", il);
+
+    return build_attn(inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, sinks, nullptr, kq_scale, il, kq_mask);
 }
 
 ggml_tensor * llm_graph_context::build_attn(
@@ -5259,6 +5335,77 @@ ggml_tensor * llm_graph_context::build_rs(
                     get_state_rows);
 }
 
+// write the last n_cols time steps of conv_x into the recurrent state of the current sequence at `offs`
+void llm_graph_context::build_conv_state_store(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+        ggml_tensor * conv_x,
+            int64_t   n_cols,
+             size_t   offs) const {
+    const auto * mctx_cur = inp->mctx;
+
+    const int64_t n        = conv_x->ne[0] - n_cols; // n_seq_tokens
+    const int64_t channels = conv_x->ne[1];
+    const int64_t n_seqs   = conv_x->ne[2];
+
+    const size_t row_size  = s->nb[1];
+    const size_t mem_size  = mctx_cur->get_size();
+    const size_t head      = mctx_cur->get_head();
+    const size_t row_count = n_cols*channels;
+
+    if (cparams.n_rs_seq == 0) {
+        ggml_tensor * last = ggml_view_3d(ctx0, conv_x,
+                n_cols, channels, n_seqs,
+                conv_x->nb[1], conv_x->nb[2],
+                ggml_row_size(conv_x->type, n));
+
+        ggml_tensor * cell = ggml_view_2d(ctx0, s,
+                row_count, n_seqs,
+                row_size, head*row_size + offs);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last, cell));
+        return;
+    }
+
+    // [TAG_RECURRENT_ROLLBACK_SPLITS]
+    // keep the snapshots of the previous batches before the suffix of this batch overwrites them
+    const int64_t K         = (int64_t) cparams.n_rs_seq + 1;
+    const int64_t n_written = std::min(n, K);
+
+    if (inp->s_history) {
+        const int64_t n_history = inp->s_history->ne[0] / n_seqs;
+        const size_t state_rows = row_count;
+
+        ggml_tensor * rows = ggml_reshape_2d(ctx0, s, state_rows, s->ne[1]);
+        ggml_tensor * previous = ggml_get_rows(ctx0, rows, inp->s_history);
+        ggml_build_forward_expand(gf, previous);
+
+        for (int64_t age = 0; age < n_history; ++age) {
+            ggml_tensor * src = ggml_view_2d(ctx0, previous, state_rows, n_seqs,
+                    previous->nb[1], age*n_seqs*row_size);
+            ggml_tensor * dst = ggml_view_2d(ctx0, s, state_rows, n_seqs,
+                    s->nb[1], ((n_written + age)*mem_size + head)*row_size + offs);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        }
+    }
+
+    for (int64_t t = K - n_written + 1; t <= K; ++t) {
+        const int64_t s_idx  = std::max<int64_t>(0, n - K + t);
+        const int64_t s_slot = K - t;
+
+        ggml_tensor * last = ggml_view_3d(ctx0, conv_x,
+                n_cols, channels, n_seqs,
+                conv_x->nb[1], conv_x->nb[2],
+                ggml_row_size(conv_x->type, s_idx));
+
+        ggml_tensor * cell = ggml_view_2d(ctx0, s,
+                row_count, n_seqs,
+                row_size, (s_slot*mem_size + head)*row_size + offs);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last, cell));
+    }
+}
+
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
     llm_graph_input_rs * inp,
     const llama_ubatch & ubatch,
@@ -5322,7 +5469,7 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
     return (llm_graph_input_mem_hybrid_k *) res->add_input(std::move(inp));
 }
 
-llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa() const {
+llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa(uint32_t extent, uint32_t extent_swa) const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_iswa_context *>(mctx);
 
     auto inp_rs = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
@@ -5357,7 +5504,18 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
                 inp_attn->self_tail_run_desc_swa, true);
     }
 
-    auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+    auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
+
+    if (extent > 0) {
+        inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_pos);
+        ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
+    }
+    if (extent_swa > 0) {
+        inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_pos_swa);
+        ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+    }
 
     return (llm_graph_input_mem_hybrid_iswa *) res->add_input(std::move(inp));
 }
