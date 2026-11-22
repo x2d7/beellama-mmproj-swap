@@ -25,14 +25,25 @@ void * g_evict_ud = nullptr;
 // every buffer handed to the cache, in allocation order: the pool is a bump
 // allocator with a LIFO free, so the whole list is returned in reverse at the end of
 // the compute. Dropping a cache entry must NOT free, it may sit below live ones.
-std::vector<std::pair<void *, size_t>> g_allocs;
+// The evict callback belongs to the backend context (and therefore the pool) that
+// allocated the buffer: the cache is global, but the compute pools are per backend
+// context, so the clip backend must not free a llama-pool buffer (and vice versa).
+struct alloc_rec {
+    void * ptr;
+    size_t size;
+    void (*evict)(void *, void *, size_t);
+    void * ud;
+};
+
+std::vector<alloc_rec> g_allocs;
 
 long g_hits = 0, g_misses = 0, g_resets = 0;
 
 void evict_all() {
     for (size_t i = g_allocs.size(); i-- > 0; ) {
-        if (g_evict != nullptr && g_allocs[i].first != nullptr) {
-            g_evict(g_evict_ud, g_allocs[i].first, g_allocs[i].second);
+        const auto & a = g_allocs[i];
+        if (a.evict != nullptr && a.ptr != nullptr) {
+            a.evict(a.ud, a.ptr, a.size);
         }
     }
     g_allocs.clear();
@@ -84,7 +95,7 @@ void ggml_cuda_q8_cache_put(const void * src, size_t src_bytes,
         g_cache.erase(g_cache.begin());
     }
     g_cache.push_back({ src, src_bytes, ne10, ne11, ne12, ne13, type_src0, buf, size });
-    g_allocs.push_back({ buf, size });
+    g_allocs.push_back({ buf, size, g_evict, g_evict_ud });
 }
 
 void ggml_cuda_q8_cache_invalidate(const void * ptr, size_t bytes) {
