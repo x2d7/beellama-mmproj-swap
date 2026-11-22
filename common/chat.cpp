@@ -1260,6 +1260,13 @@ static common_chat_params_init_fn common_chat_template_detect_params_init(const 
         return common_chat_params_init_ling3;
     }
 
+    // Inkling 1/2 - TML blocks closed by <|end_message|>; a tool call is
+    // <|message_model|>NAME<|content_invoke_tool_json|>{"name":...,"args":{...}}<|end_message|>
+    if (is_inkling_template(src)) {
+        LOG_DBG("Using specialized template: Inkling\n");
+        return common_chat_params_init_inkling;
+    }
+
     // Cohere2 MoE / North Code - marker-wrapped format with <|START_TEXT|> content and
     // <|START_ACTION|> JSON tool calls. <|START_TEXT|> is unique to this template (the older
     // Command-R templates use <|START_RESPONSE|>).

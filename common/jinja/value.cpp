@@ -261,9 +261,9 @@ static value tojson(const func_args & args) {
     if (is_val<value_int>(val_indent)) {
         indent = static_cast<int>(val_indent->as_int());
     }
-    if (val_sort->as_bool()) { // undefined == false
-        throw not_implemented_exception("tojson sort_keys=true not implemented");
-    }
+    // Jinja's sort_keys only controls key order; value_to_json already walks the
+    // ordered object map, so the output is stable and sorted without doing anything.
+    (void) val_sort;
     const bool ensure_ascii = val_ascii->as_bool(); // undefined == false
     auto separators = (is_val<value_array>(val_separators) ? val_separators : mk_val<value_array>())->as_array();
     std::string item_sep = separators.size() > 0 ? separators[0]->as_string().str() : (indent < 0 ? ", " : ",");

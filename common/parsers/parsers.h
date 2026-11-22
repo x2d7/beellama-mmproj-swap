@@ -41,6 +41,8 @@ std::string common_chat_template_generation_prompt_impl(
 
 bool is_lfm2_template(const std::string & src);
 
+bool is_inkling_template(const std::string & src);
+
 namespace workaround {
 
 void convert_tool_responses_gemma4(json & messages);
@@ -56,6 +58,8 @@ common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_te
 common_chat_params common_chat_params_init_gemma4(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
 
 common_chat_params common_chat_params_init_gigachat_v3(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
+
+common_chat_params common_chat_params_init_inkling(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
 
 common_chat_params common_chat_params_init_gpt_oss(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
 
