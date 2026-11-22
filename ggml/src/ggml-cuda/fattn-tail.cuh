@@ -124,7 +124,7 @@ static __global__ void k_flash_attn_ext_tail_pack_q_mask(
         int d, int n_query, int n_head, int n_stream,
         int mask_stride, int tail_stride, int q_max, int n_active,
         size_t q_nb1, size_t q_nb2, size_t q_nb3,
-        size_t m_nb1, size_t m_nb3) {
+        size_t m_nb1, size_t m_nb2, size_t m_nb3) {
     const size_t n_q = size_t(d)*q_max*n_head*n_active;
     for (size_t i = size_t(blockIdx.x)*blockDim.x + threadIdx.x;
             i < n_q; i += size_t(blockDim.x)*gridDim.x) {
@@ -144,12 +144,13 @@ static __global__ void k_flash_attn_ext_tail_pack_q_mask(
         q_packed[i] = value;
     }
 
-    const size_t n_m = size_t(tail_stride)*q_max*n_active;
+    const size_t n_m = size_t(tail_stride)*q_max*n_head*n_active;
     for (size_t i = size_t(blockIdx.x)*blockDim.x + threadIdx.x;
             i < n_m; i += size_t(blockDim.x)*gridDim.x) {
         size_t rem = i;
         const int it = int(rem % tail_stride); rem /= tail_stride;
         const int iq_packed = int(rem % q_max); rem /= q_max;
+        const int ih = int(rem % n_head); rem /= n_head;
         const int ia = int(rem);
         const int iq_global = query_order[ia*q_max + iq_packed];
         half value = __float2half(-INFINITY);
@@ -157,7 +158,7 @@ static __global__ void k_flash_attn_ext_tail_pack_q_mask(
             const int is = iq_global/n_query;
             const int iq = iq_global - is*n_query;
             value = *reinterpret_cast<const half *>(reinterpret_cast<const char *>(mask) +
-                size_t(it)*sizeof(half) + size_t(iq)*m_nb1 + size_t(is)*m_nb3);
+                size_t(it)*sizeof(half) + size_t(iq)*m_nb1 + size_t(ih)*m_nb2 + size_t(is)*m_nb3);
         }
         mask_packed[i] = value;
     }
@@ -195,7 +196,7 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
         size_t vt_nb0, size_t vt_nb1, size_t vt_nb2,
         size_t ktc_nb0, size_t ktc_nb1, size_t ktc_nb2,
         size_t vtc_nb0, size_t vtc_nb1, size_t vtc_nb2,
-        size_t mt_nb1, size_t mt_nb3,
+        size_t mt_nb1, size_t mt_nb2, size_t mt_nb3,
         bool tail_bodyless, bool body_packed,
         size_t body_nb1, size_t body_nb2, size_t body_nb3,
         size_t dst_nb1, size_t dst_nb2, size_t dst_nb3) {
@@ -254,7 +255,7 @@ static __global__ void k_flash_attn_ext_tail_indexed_small(
         if (lane == 0) {
             const float mask = __half2float(*reinterpret_cast<const half *>(
                     reinterpret_cast<const char *>(mt) + size_t(token)*sizeof(half) +
-                    size_t(iq)*mt_nb1 + size_t(is)*mt_nb3));
+                    size_t(iq)*mt_nb1 + size_t(ih)*mt_nb2 + size_t(is)*mt_nb3));
             float score = dot*scale;
             if (logit_softcap != 0.0f) {
                 score = logit_softcap*tanhf(score/logit_softcap);
@@ -548,6 +549,7 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     const int compute_stride = tail_bodyless ?
             int(GGML_PAD(tail_stride, FATTN_KQ_STRIDE)) :
             int(ggml_cuda_tail_compute_stride(tail_stride));
+
     const size_t n_tail_rows = size_t(q_max)*n_head*n_active;
     const size_t n_body_rows = body_packed ? n_tail_rows : size_t(n_query)*n_head*n_stream;
 
@@ -563,7 +565,7 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     const size_t kt_elements = size_t(d_k)*compute_stride*n_head_k*n_active;
     const size_t vt_elements = size_t(d_v)*compute_stride*n_head_v*n_active;
     const size_t q_elements = size_t(d_k)*q_max*n_head*n_active;
-    const size_t mask_elements = size_t(compute_stride)*q_max*n_active;
+    const size_t mask_elements = size_t(compute_stride)*q_max*n_head*n_active;
     const size_t body_mask_elements = body_packed && !tail_bodyless ?
             size_t(body_stride)*q_max*n_active : 1;
     const size_t kb_row_bytes = ggml_row_size(kb->type, d_k);
@@ -664,7 +666,7 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             (const float *) q->data, (const half *) mt->data, (const int32_t *) qo->data,
             q_alloc.get(), mask_alloc.get(), d_k, n_query, n_head, n_stream,
             tail_stride, compute_stride, q_max, n_active,
-            q->nb[1], q->nb[2], q->nb[3], mt->nb[1], mt->nb[3]);
+            q->nb[1], q->nb[2], q->nb[3], mt->nb[1], mt->nb[2], mt->nb[3]);
     }
     if (body_packed && !tail_bodyless) {
         k_flash_attn_ext_tail_pack_body_rows<<<blocks_for(kb_packed_bytes), threads, 0, ctx.stream()>>>(
@@ -693,7 +695,7 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     ggml_cuda_tail_make_contiguous(v_packed, d_v, compute_stride, n_head_v, n_active, ggml_type_size(vt->type));
     ggml_tensor mask_packed = *mt;
     mask_packed.data = mask_alloc.get();
-    ggml_cuda_tail_make_contiguous(mask_packed, compute_stride, q_max, 1, n_active, sizeof(half));
+    ggml_cuda_tail_make_contiguous(mask_packed, compute_stride, q_max, n_head, n_active, sizeof(half));
 
     ggml_tensor body_meta = *qo;
     body_meta.type = GGML_TYPE_F32;
@@ -815,7 +817,7 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             history_slots, kt->nb[0], kt->nb[1], kt->nb[2], vt->nb[0], vt->nb[1], vt->nb[2], \
             kt_current ? kt_current->nb[0] : 0, kt_current ? kt_current->nb[1] : 0, kt_current ? kt_current->nb[2] : 0, \
             vt_current ? vt_current->nb[0] : 0, vt_current ? vt_current->nb[1] : 0, vt_current ? vt_current->nb[2] : 0, \
-            mt->nb[1], mt->nb[3], \
+            mt->nb[1], mt->nb[2], mt->nb[3], \
             tail_bodyless, body_packed, body_pass.nb[1], body_pass.nb[2], body_pass.nb[3], \
             dst->nb[1], dst->nb[2], dst->nb[3])
         if (kt->type == GGML_TYPE_F16 && vt->type == GGML_TYPE_F16) {

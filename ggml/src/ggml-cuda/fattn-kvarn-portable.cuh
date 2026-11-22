@@ -149,11 +149,13 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
         int64_t nbvt2,
         int64_t nbmt0,
         int64_t nbmt1,
+        int64_t nbmt2,
         int64_t nbmt3,
         int query_order_ne0,
         int query_order_nelements,
         int run_desc_ne0,
         int tail_mask_ne0,
+        int tail_mask_ne2,
         bool k_tail_bf16,
         bool v_tail_bf16,
         bool v_original_domain,
@@ -404,7 +406,8 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
             if (tid == 0) {
                 const half * tail_mask = (const half *) (
                     tail_mask_data + (size_t) token * nbmt0 +
-                    (size_t) query * nbmt1 + (size_t) stream * nbmt3);
+                    (size_t) query * nbmt1 + (size_t) (query_head % tail_mask_ne2) * nbmt2 +
+                    (size_t) stream * nbmt3);
                 const float mask_value = slope * __half2float(*tail_mask);
                 float score = reduction[0] * scale;
                 if (logit_softcap != 0.0f) {
@@ -959,11 +962,13 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
             vt ? vt->nb[2] : 0,
             mt ? mt->nb[0] : 0,
             mt ? mt->nb[1] : 0,
+            mt ? mt->nb[2] : 0,
             mt ? mt->nb[3] : 0,
             qo ? (int) qo->ne[0] : 0,
             qo ? (int) ggml_nelements(qo) : 0,
             rd ? (int) rd->ne[0] : 0,
             mt ? (int) mt->ne[0] : 0,
+            mt ? (int) mt->ne[2] : 1,
             kt && kt->type == GGML_TYPE_BF16,
             vt && vt->type == GGML_TYPE_BF16,
             v_original_domain,

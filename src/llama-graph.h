@@ -1498,7 +1498,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il,
-            ggml_tensor * kq_mask_override = nullptr) const; // [n_kv, n_tokens/n_stream, n_head, n_stream], replaces the mask
+            ggml_tensor * kq_mask_override = nullptr, // [n_kv, n_tokens/n_stream, n_head, n_stream], replaces the mask
+            ggml_tensor * kq_b_tail = nullptr) const; // pure [n_kv, n_head, n_tokens/n_stream, n_stream] bias for the exact tail
 
     llm_graph_input_attn_k_iswa * build_attn_inp_k_iswa() const;
 

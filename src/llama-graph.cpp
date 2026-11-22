@@ -3440,7 +3440,8 @@ ggml_tensor * llm_graph_context::build_attn_bias_tail(
     ggml_tensor * tail = ggml_get_rows(ctx0, bias_rows, flat_idxs);
     tail = ggml_reshape_4d(ctx0, tail, kq_b->ne[1], kq_mask_tail->ne[0],
             kq_mask_tail->ne[1], kq_mask_tail->ne[3]);
-    return ggml_permute(ctx0, tail, 1, 2, 0, 3);
+    // [head, stride, n_query, stream] -> [stride, n_query, head, stream]
+    return ggml_permute(ctx0, tail, 2, 0, 1, 3);
 }
 
 ggml_tensor * llm_graph_context::build_attn_mha(
@@ -3840,6 +3841,7 @@ static void build_attn_inp_tail(
      const llama_ubatch & ubatch,
     const llama_kv_cache_context * mctx,
              ggml_tensor * kq_mask,
+                int64_t   n_head_mask,
              ggml_tensor *& tail_idxs,
              ggml_tensor *& tail_read_idxs,
              ggml_tensor *& tail_body_read_idxs,
@@ -3865,8 +3867,10 @@ static void build_attn_inp_tail(
             ctx0, GGML_TYPE_I32, attention_stride, ubatch.n_tokens);
     tail_bias_read_idxs = ggml_new_tensor_2d(
             ctx0, GGML_TYPE_I32, attention_stride, ubatch.n_tokens);
+    // the tail mask carries a head dimension: a model that folds a per-head KQ bias into
+    // its mask needs that bias on the tail positions too (see build_attn_bias_tail)
     kq_mask_tail = ggml_new_tensor_4d(ctx0, kq_mask->type,
-            attention_stride, kq_mask->ne[1], 1, kq_mask->ne[3]);
+            attention_stride, kq_mask->ne[1], n_head_mask, kq_mask->ne[3]);
     for (ggml_tensor * input : {
             tail_read_idxs, tail_body_read_idxs, tail_bias_read_idxs, kq_mask_tail }) {
         ggml_set_input(input);
@@ -3956,7 +3960,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
-        build_attn_inp_tail(ctx0, ubatch, mctx_cur, inp->self_kq_mask,
+        build_attn_inp_tail(ctx0, ubatch, mctx_cur, inp->self_kq_mask, hparams.n_head(),
                 inp->self_tail_idxs, inp->self_tail_read_idxs, inp->self_tail_body_read_idxs,
                 inp->self_tail_bias_read_idxs, inp->self_kq_mask_tail,
                 inp->self_tail_query_order, inp->self_tail_run_desc, true);
@@ -4208,7 +4212,9 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool gather_k_tail = k_tail != nullptr;
     const bool gather_v_tail = v_tail != nullptr;
     ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs();
-    llama_kv_tail_route tail_route = kq_mask_override ? LLAMA_KV_TAIL_ROUTE_NONE : mctx_cur->get_tail_route(il);
+    // a mask override (a model that folds its own per-head KQ bias) must not disable the
+    // tail: the override is folded into the tail mask below, see build_attn_bias_tail
+    llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
     // A backend query-width fallback still requires the generic tail oracle.
     // Non-causal DFlash and D64 are different: only record-consuming attention
     // is unqualified. Their materialized F16 body can retain the advertised
@@ -4279,15 +4285,6 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * kq_mask_tail = tail_route == LLAMA_KV_TAIL_ROUTE_NONE ? nullptr : inp->get_kq_mask_tail();
     ggml_tensor * kq_b_tail = build_attn_bias_tail(
             kq_b, inp->get_tail_bias_read_idxs(), kq_mask_tail);
-    if (kq_mask_override && kq_mask_tail) {
-        ggml_tensor * selected = build_attn_bias_tail(
-                ggml_permute(ctx0, kq_mask_override, 0, 2, 1, 3),
-                inp->get_tail_bias_read_idxs(), kq_mask_tail);
-        selected = ggml_cont(ctx0, ggml_permute(ctx0, selected, 1, 2, 0, 3));
-        selected = ggml_cast(ctx0, selected, kq_mask_tail->type);
-        GGML_ASSERT(ggml_are_same_shape(selected, kq_mask_tail));
-        kq_mask_tail = ggml_add(ctx0, kq_mask_tail, selected);
-    }
     ggml_tensor * body_mask = kq_mask;
     ggml_tensor * body_bias = kq_b;
     if (!mctx_cur->has_kv_body(il)) {
@@ -4561,7 +4558,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * v_mla,
             float     kq_scale,
             int       il,
-        ggml_tensor * kq_mask_override) const {
+        ggml_tensor * kq_mask_override,
+        ggml_tensor * kq_b_tail_src) const {
     const bool is_swa = hparams.is_swa(il);
 
     auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
@@ -4693,6 +4691,11 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * kq_mask = kq_mask_override ? kq_mask_override :
         (is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask());
+    if (kq_mask_override && mctx_cur->get_tail_tokens() > 0) {
+        // the override carries the model's per-head bias; the cache's mask carries the
+        // body/exact exclusion that keeps tail cells out of the body pass
+        kq_mask = ggml_add(ctx0, kq_mask_override, is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask());
+    }
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = use_kv_cur ? k_cur : use_kvarn ?
@@ -4782,8 +4785,22 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
     ggml_tensor * kq_mask_tail = tail_route == LLAMA_KV_TAIL_ROUTE_NONE ? nullptr : inp->get_kq_mask_tail(is_swa);
+    // The model may fold its per-head bias into a mask override, but that override is
+    // built from the same cache mask the tail filler mutates: its tail cells are -inf.
+    // The tail bias therefore has to come from the pure bias tensor, not the override.
     ggml_tensor * kq_b_tail = build_attn_bias_tail(
             kq_b, inp->get_tail_bias_read_idxs(is_swa), kq_mask_tail);
+    if (kq_b == nullptr && kq_b_tail_src != nullptr && kq_mask_tail != nullptr) {
+        // the native tail merge has no separate bias input: fold the pure per-head bias
+        // into the tail mask, the same way the body folds it into its mask
+        ggml_tensor * tail_bias = build_attn_bias_tail(
+                kq_b_tail_src, inp->get_tail_bias_read_idxs(is_swa), kq_mask_tail);
+        if (tail_bias != nullptr) {
+            tail_bias = ggml_cast(ctx0, tail_bias, kq_mask_tail->type);
+            GGML_ASSERT(ggml_are_same_shape(tail_bias, kq_mask_tail));
+            kq_mask_tail = ggml_add(ctx0, kq_mask_tail, tail_bias);
+        }
+    }
     ggml_tensor * body_mask = kq_mask;
     ggml_tensor * body_bias = kq_b;
     if (!mctx_cur->has_kv_body(il)) {
@@ -4949,11 +4966,9 @@ ggml_tensor * llm_graph_context::build_attn(
     auto * inp_attn = inp->get_attn();
 
     // the bias is folded into the mask, where flash attention takes it per head.
-    // KVarN cannot run on this model: it needs a KV tail, the tail needs the KQ bias as a
-    // separate tensor (this fork's flash attention rejects one), and the hybrid memory it
-    // would have to live in has no KVarN integration at all (llama-memory-hybrid.cpp).
-    GGML_ASSERT(inp_attn->mctx->get_base()->get_tail_tokens() == 0 &&
-            "the per-head relative-position mask does not support the KV tail");
+    // A KV tail (KVarN) is supported with a per-head mask: the tail mask carries a head
+    // dimension, the cache fills the causal/exclusion pattern in every head block, and the
+    // pure bias is folded into the tail mask by build_attn() below.
 
     ggml_tensor * kq_mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
     if (kq_mask->type != GGML_TYPE_F32) {
@@ -4971,7 +4986,11 @@ ggml_tensor * llm_graph_context::build_attn(
     kq_mask = ggml_add(ctx0, kq_b, kq_mask);
     cb(kq_mask, "kq_mask_rel_pos", il);
 
-    return build_attn(inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, sinks, nullptr, kq_scale, il, kq_mask);
+    // the mask layout is [n_kv, n_tokens, n_head, stream]; the tail bias helper takes
+    // [n_kv, n_head, n_tokens, stream], so swap head and query for it
+    ggml_tensor * kq_b_tail = ggml_permute(ctx0, kq_b, 0, 2, 1, 3);
+    return build_attn(inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, sinks, nullptr, kq_scale, il,
+            kq_mask, kq_b_tail);
 }
 
 ggml_tensor * llm_graph_context::build_attn(
@@ -5117,7 +5136,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur->get_base(), ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
-        build_attn_inp_tail(ctx0, ubatch, mctx_cur->get_base(), inp->self_kq_mask,
+        build_attn_inp_tail(ctx0, ubatch, mctx_cur->get_base(), inp->self_kq_mask, hparams.n_head(),
                 inp->self_tail_idxs, inp->self_tail_read_idxs, inp->self_tail_body_read_idxs,
                 inp->self_tail_bias_read_idxs, inp->self_kq_mask_tail,
                 inp->self_tail_query_order, inp->self_tail_run_desc, true);
@@ -5131,7 +5150,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
         inp->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, mctx_cur->get_swa(), ubatch, cparams);
         inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
-        build_attn_inp_tail(ctx0, ubatch, mctx_cur->get_swa(), inp->self_kq_mask_swa,
+        build_attn_inp_tail(ctx0, ubatch, mctx_cur->get_swa(), inp->self_kq_mask_swa, hparams.n_head(),
                 inp->self_tail_idxs_swa, inp->self_tail_read_idxs_swa,
                 inp->self_tail_body_read_idxs_swa, inp->self_tail_bias_read_idxs_swa,
                 inp->self_kq_mask_tail_swa, inp->self_tail_query_order_swa, inp->self_tail_run_desc_swa, true);
@@ -5488,7 +5507,7 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa(u
 
         inp_attn->self_kq_mask = build_attn_inp_kq_mask(ctx0, attn_ctx->get_base(), ubatch, cparams);
         inp_attn->self_kq_mask_cnv = inp_attn->self_kq_mask;
-        build_attn_inp_tail(ctx0, ubatch, attn_ctx->get_base(), inp_attn->self_kq_mask,
+        build_attn_inp_tail(ctx0, ubatch, attn_ctx->get_base(), inp_attn->self_kq_mask, hparams.n_head(),
                 inp_attn->self_tail_idxs, inp_attn->self_tail_read_idxs,
                 inp_attn->self_tail_body_read_idxs, inp_attn->self_tail_bias_read_idxs,
                 inp_attn->self_kq_mask_tail, inp_attn->self_tail_query_order, inp_attn->self_tail_run_desc, true);
@@ -5500,7 +5519,7 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa(u
 
         inp_attn->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
         inp_attn->self_kq_mask_swa_cnv = inp_attn->self_kq_mask_swa;
-        build_attn_inp_tail(ctx0, ubatch, attn_ctx->get_swa(), inp_attn->self_kq_mask_swa,
+        build_attn_inp_tail(ctx0, ubatch, attn_ctx->get_swa(), inp_attn->self_kq_mask_swa, hparams.n_head(),
                 inp_attn->self_tail_idxs_swa, inp_attn->self_tail_read_idxs_swa,
                 inp_attn->self_tail_body_read_idxs_swa, inp_attn->self_tail_bias_read_idxs_swa,
                 inp_attn->self_kq_mask_tail_swa, inp_attn->self_tail_query_order_swa,

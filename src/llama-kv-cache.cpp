@@ -7613,6 +7613,27 @@ void llama_kv_cache::set_input_kq_mask_tail_mapped(
                 ubatch, n_kv, attention_stride, causal_attn,
                 physical_to_read.empty() ? nullptr : &physical_to_read);
     }
+
+    // Per-head tail mask: the planner fills the causal/exclusion pattern once, in the
+    // (head 0, stream 0) block. The same pattern holds for every head and stream; the
+    // per-head KQ bias is added afterwards in the graph (build_attn_bias_tail).
+    const int64_t n_blocks = exact->ne[2]*exact->ne[3];
+    // multi-stream tails carry a different pattern per stream; only the single-stream
+    // layout is replicated here (the graph routes one stream per sequence today)
+    if (n_blocks > 1 && exact->ne[3] == 1) {
+        const size_t block = size_t(attention_stride)*exact->ne[1];
+        if (exact->type == GGML_TYPE_F16) {
+            ggml_fp16_t * d = static_cast<ggml_fp16_t *>(exact->data);
+            for (int64_t b = 1; b < n_blocks; ++b) {
+                memcpy(d + b*block, d, block*sizeof(ggml_fp16_t));
+            }
+        } else {
+            float * d = static_cast<float *>(exact->data);
+            for (int64_t b = 1; b < n_blocks; ++b) {
+                memcpy(d + b*block, d, block*sizeof(float));
+            }
+        }
+    }
 }
 
 bool llama_kv_cache::can_pack_tail_body(const llama_ubatch & ubatch) const {
