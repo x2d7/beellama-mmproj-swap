@@ -950,6 +950,53 @@ mtmd_image_preprocessor_llava_uhd::slice_instructions mtmd_image_preprocessor_mi
 }
 
 //
+// mtmd_image_preprocessor_inkling2v
+//
+
+static int inkling2v_align_up(int x, int a) {
+    return (x + a - 1) / a * a;
+}
+
+mtmd_image_preproc_out mtmd_image_preprocessor_inkling2v::preprocess(const clip_image_u8 & input) const {
+    const int align = hparams.patch_size * hparams.n_merge;
+    auto size = input.get_size();
+    clip_image_u8 resized;
+    const bool too_large = hparams.image_max_pixels > 0 &&
+        int64_t(inkling2v_align_up(size.width,  align)) *
+        int64_t(inkling2v_align_up(size.height, align)) > hparams.image_max_pixels;
+    if (too_large) {
+        img_tool::calc_size_opt opts;
+        opts.align_size = align;
+        opts.max_pixels = hparams.image_max_pixels;
+        size = img_tool::calc_size_preserved_ratio(size, opts);
+        img_tool::resize(input, resized, size, hparams.image_resize_algo, PAD_NONE);
+    }
+    const clip_image_u8 & img = too_large ? resized : input;
+    const int width  = inkling2v_align_up(size.width,  align);
+    const int height = inkling2v_align_up(size.height, align);
+    clip_image_f32 padded;
+    padded.set_size({width, height}, img.is_placeholder(), false);
+    if (!img.is_placeholder()) {
+        std::vector<float> pixels(size_t(width) * height * 3, -1.0f);
+        const auto & src = img.get_ro_buf();
+        for (int y = 0; y < size.height; ++y) {
+            std::copy_n(src.begin() + size_t(y) * size.width * 3, size_t(size.width) * 3,
+                        pixels.begin() + size_t(y) * width * 3);
+        }
+        padded.cpy_buf(pixels);
+        float mean[3], std[3];
+        for (int c = 0; c < 3; ++c) {
+            mean[c] = hparams.image_mean[c] * 255.0f;
+            std[c]  = hparams.image_std[c]  * 255.0f;
+        }
+        padded.normalize(mean, std);
+    }
+    mtmd_image_preproc_out result;
+    result.append(hparams, padded, false);
+    return result;
+}
+
+//
 // mtmd_image_preprocessor_lfm2
 //
 

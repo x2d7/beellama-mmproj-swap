@@ -982,6 +982,12 @@ struct mtmd_context {
                     image_preproc = std::make_unique<mtmd_image_preprocessor_deepseekocr>(ctx_v);
                     ov_img_first = false;
                 } break;
+            case PROJECTOR_TYPE_INKLING2V:
+                {
+                    // the chat template code gives the image its own message block
+                    img_beg = "<|content_image|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_inkling2v>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_HUNYUANVL:
                 {
                     // note: these use fullwidth ｜ (U+FF5C) and ▁ (U+2581) to match the tokenizer vocabulary

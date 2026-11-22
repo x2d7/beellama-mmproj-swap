@@ -1031,6 +1031,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_sensenova_u1>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_INKLING2V:
+            {
+                builder = std::make_unique<clip_graph_inkling2v>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_LING3VL:
             {
                 builder = std::make_unique<clip_graph_ling3vl>(ctx, img);
@@ -2255,6 +2259,13 @@ struct clip_model_loader {
                         get_u32(KEY_PROJ_SAMPLE_WINDOW_SIDE, hparams.downsample_window_side);
                         hparams.warmup_image_size = hparams.image_size;
                     } break;
+                case PROJECTOR_TYPE_INKLING2V:
+                    {
+                        hparams.ffn_op = FFN_GELU_ERF;
+                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge);
+                        hparams.rope_theta = 10000.0f;
+                        hparams.set_limit_image_tokens(1, 4096);
+                    } break;
                 default:
                     throw std::runtime_error(string_format("%s: unknown vision projector type %s\n", __func__, proj_type.c_str()));
             }
@@ -2474,6 +2485,7 @@ struct clip_model_loader {
         };
 
         model.class_embedding = get_tensor(TN_CLASS_EMBD, false);
+        model.class_position_embedding = get_tensor(TN_CLASS_POS_EMBD ".weight", false);
 
         model.pre_ln_w = get_tensor(string_format(TN_LN_PRE, prefix, "weight"), false);
         model.pre_ln_b = get_tensor(string_format(TN_LN_PRE, prefix, "bias"),   false);
@@ -3031,6 +3043,11 @@ struct clip_model_loader {
                     model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"));
                     model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                } break;
+            case PROJECTOR_TYPE_INKLING2V:
+                {
+                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
                 } break;
             case PROJECTOR_TYPE_LFM2:
             case PROJECTOR_TYPE_D1OMNI_V:
@@ -4585,6 +4602,12 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 const int n_llm_h = CLIP_ALIGN(img->ny(), out_patch_size) / out_patch_size;
                 n_patches = dsv4_get_block_layout(n_llm_w, n_llm_h, img->lead_pad).n_out;
             } break;
+        case PROJECTOR_TYPE_INKLING2V:
+            {
+                // the projector merges n_merge x n_merge patches per output token
+                const int stride = ctx->model.hparams.n_merge * ctx->model.hparams.n_merge;
+                n_patches = CLIP_ALIGN(n_patches, stride) / stride;
+            } break;
         case PROJECTOR_TYPE_PADDLEOCR:
         case PROJECTOR_TYPE_DOTS_OCR:
         case PROJECTOR_TYPE_DOTS3NOTE_V:
@@ -5153,6 +5176,19 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 std::vector<float> tail = st->stem_tail;
                 tail.resize(hparams.n_embd, 0.0f);
                 set_input_f32("inp_stem_tail", tail);
+            } break;
+        case PROJECTOR_TYPE_INKLING2V:
+            {
+                // CLS is at position 0, the patches are 1-indexed
+                std::vector<int32_t> positions_w{0}, positions_h{0};
+                for (int y = 0; y < pos_h; ++y) {
+                    for (int x = 0; x < pos_w; ++x) {
+                        positions_w.push_back(x + 1);
+                        positions_h.push_back(y + 1);
+                    }
+                }
+                set_input_i32("pos_w", positions_w);
+                set_input_i32("pos_h", positions_h);
             } break;
         case PROJECTOR_TYPE_MUSE_GLIMMER:
             {
@@ -6604,6 +6640,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_YASA2:
         case PROJECTOR_TYPE_DEEPSEEK4V:
         case PROJECTOR_TYPE_COHERE2V:
+        case PROJECTOR_TYPE_INKLING2V:
             return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_HUNYUANVL:
             return ctx->model.mm_model_proj->ne[1];

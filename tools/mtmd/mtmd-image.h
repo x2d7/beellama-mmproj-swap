@@ -224,6 +224,12 @@ private:
     static std::vector<clip_image_size> get_target_ratios(const clip_hparams & hparams);
 };
 
+// Inkling2V: keep the aspect ratio, align to patch_size*n_merge, pad with -1 and normalize
+struct mtmd_image_preprocessor_inkling2v : mtmd_image_preprocessor {
+    using mtmd_image_preprocessor::mtmd_image_preprocessor;
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+};
+
 struct mtmd_image_preprocessor_idefics3 : mtmd_image_preprocessor_llava_uhd {
     mtmd_image_preprocessor_idefics3(const clip_ctx * ctx) : mtmd_image_preprocessor_llava_uhd(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;

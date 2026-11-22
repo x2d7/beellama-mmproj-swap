@@ -12,6 +12,11 @@
  * We encourage human contributors to ensure the quality and reliability of the codebase.
  */
 
+struct clip_graph_inkling2v : clip_graph {
+    clip_graph_inkling2v(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+};
+
 struct clip_graph_siglip : clip_graph {
     clip_graph_siglip(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
